@@ -10,36 +10,43 @@ This is a simplified version of a real, hard distributed-systems problem: how do
 
 ## How the algorithm works
 
-1. Every tick, the simulation rebuilds the mesh from scratch: two drones are connected if they're both alive and within radio (`comm_range`) of each other. This is pure geometry, recomputed fresh every tick — no persistent wiring.
-2. The mesh naturally splits into **connected components** (drones that can't currently reach each other end up in separate groups — this happens automatically if a kill severs the only bridge between two clusters).
-3. Each component checks: is there a drone here that's alive and confirmed as its own nexus? If yes, everyone else in the component just falls in line behind it.
-4. If not, an election starts: every drone in the component nominates itself. Then, once per tick, each drone adopts the best candidate (highest `priority`, drone id as a tiebreaker) it's heard from its immediate neighbors so far. That "best so far" value spreads outward one hop per tick.
-5. Once every drone in the component has converged on the same candidate, that candidate becomes the confirmed nexus — and the flood stops.
+No drone here has instant, perfect knowledge of the swarm. Every drone runs its own independent election state machine (`NexusElection` in `drone_swarm/election.py`), and everything it believes is purely a function of which messages have actually reached it — over `MeshNetwork` (`drone_swarm/mesh_network.py`), a genuinely simulated radio mesh with realistic per-hop **latency**, **packet loss**, and a **hop limit**, not instant perfect delivery.
 
-Because this is just geometry + a synchronous flood recomputed every tick, cascading failures, network partitions, and swarms merging back together aren't special-cased — they fall directly out of the same mechanism:
-- **Cascading handoff**: kill the new nexus, and next tick nobody in its component has a confirmed nexus anymore, so a new election kicks off automatically.
-- **Partition tolerance**: if a kill splits the mesh into two physically disconnected groups, each group independently notices it has no nexus (or keeps the one it already had) and resolves on its own — you can end up with two nexuses at once, one per island, until they're reconnected.
-- **Merge / runoff**: drones drift (see Movement below), so two settled swarms can drift back into range of each other. For one tick, their connected component has *two* self-confirmed nexuses at once — the code detects that ambiguity and runs a fresh flood as a runoff instead of arbitrarily keeping whichever one it happened to check first, so the higher-priority incumbent always wins, deterministically.
+1. A drone with no live nexus — never seen one, or its heartbeats have gone stale for longer than `nexus_timeout_s` — opens an election for the next **term** and broadcasts its candidacy (an `ElectionMessage` carrying its `priority`).
+2. Candidacies are ordered by `(priority, drone_id)` — highest priority wins, id breaks ties deterministically.
+3. A candidate that hears a better candidacy for its term steps back; the sole un-superseded candidate declares victory once its election window closes, and starts broadcasting `NexusHeartbeat`s.
+4. Followers refresh their "nexus is alive" clock on every heartbeat they receive. No heartbeat for longer than `nexus_timeout_s` and they conclude the nexus is gone and open a new election themselves.
+
+This is a proper Bully-algorithm implementation, not a shortcut — messages actually propagate hop-by-hop through `MeshNetwork.deliver_due_messages`, with real relay (up to `max_relay_hops`) and a `seen_by` set so a flooded message can't loop forever.
+
+Cascading failure, partitions, and merges all fall out of this same mechanism, no special-casing required:
+- **Cascading handoff**: kill the nexus, and every drone that was following it eventually times out and re-elects — automatically, repeatedly, however many times you do it.
+- **Partition tolerance**: sever the only bridge between two clusters and each side independently notices (or keeps) its own nexus — you can end up with two nexuses at once, one per island.
+- **Merge**: when two islands drift back into range, the two nexuses' heartbeats reach each other, and the tie resolves the way real consensus protocols do it — **the newer term always wins on contact, and same-term ties go to the higher drone id**, not priority. Priority only ever decides a single fresh election, never a stale-vs-fresh conflict — an old, possibly-stale nexus's priority claim isn't trustworthy evidence about what happened on the other side of a partition; recency is. So merges are just ordinary heartbeat handling, with no dedicated merge/runoff code path at all.
+
+An earlier version of this project used a synchronous global recompute each tick instead — every drone had instant, perfect knowledge of the whole mesh, which made convergence trivial but wasn't an honest simulation of a real network. Rebuilding it on real message-passing surfaced a genuine bug in the process: a stale, late-arriving candidacy for a term that was already decided could wrongly knock an already-elected nexus back into a fresh campaign, forever. `tests/test_election.py` has a regression test for it.
 
 ### Movement
 
-Drones aren't pinned in place — each one drifts at a constant velocity and bounces off the arena's edges (`drone_swarm/swarm.py::_move`, run at the start of every tick, before the mesh is rebuilt). This is what makes partitions and merges an ongoing, organic part of watching the demo rather than something you can only trigger by clicking — swarms split and reconverge on their own as drones wander in and out of range.
+Drones aren't pinned in place — each one drifts at a constant velocity and bounces off the arena's edges (`Swarm._move`, run at the start of every tick, before positions sync to the mesh). This is what makes partitions and merges an ongoing, organic part of watching the demo rather than something you can only trigger by clicking — swarms split and reconverge on their own as drones wander in and out of range.
 
-All the graph algorithms (`build_adjacency`, `connected_components`, `bfs_reachable` in `drone_swarm/topology.py`) are written from scratch rather than pulled from a library, so the whole thing is readable end to end.
+The mesh's actual geometric adjacency (`build_adjacency`/`connected_components`/`bfs_reachable` in `drone_swarm/topology.py`, written from scratch, no graph library) is kept separate from message delivery — it's used purely to draw the right edges in the visualization and to classify each drone's on-screen role (relay vs. leaf), not for election correctness. A drone can be geometrically "in range" of another without their messages having actually gotten through yet, or at all.
 
 ## Project structure
 
 ```
 drone_swarm/
-  model.py        # Drone dataclass
-  topology.py      # adjacency / connected components / BFS — pure graph functions
-  election.py      # the flood-based leader election algorithm
-  swarm.py          # Swarm: owns drones, advances one tick at a time
-  simulation.py    # random swarm generator
-  cli.py             # headless terminal demo, no server needed
-server.py          # FastAPI + WebSocket server for the live browser demo
-frontend/          # canvas visualization (vanilla HTML/CSS/JS, no build step)
-tests/               # pytest suite covering topology, election, and swarm behavior
+  model.py          # Drone dataclass (pure data — no election bookkeeping)
+  topology.py        # adjacency / connected components / BFS — for visualization only
+  protocol.py        # message schemas: NexusHeartbeat, ElectionMessage
+  mesh_network.py   # range-limited mesh: latency, packet loss, multi-hop relay
+  election.py        # NexusElection — per-drone heartbeat/term-based Bully algorithm
+  swarm.py            # Swarm: owns drones, the mesh, and every drone's election state
+  simulation.py      # random swarm generator
+  cli.py               # headless terminal demo, no server needed
+server.py            # FastAPI + WebSocket server for the live browser demo
+frontend/            # canvas visualization (vanilla HTML/CSS/JS, no build step)
+tests/                 # pytest suite covering topology, election, and swarm behavior
 ```
 
 ## Running it
@@ -75,8 +82,7 @@ pytest
 
 This project is deliberately scoped to a working, well-tested core first. Natural next steps if extended further:
 - **Obstacle course / objectives**: give the swarm a goal beyond just staying coordinated — navigate from start to end through obstacles and scripted "laser" hazards that pick off whichever drone is currently nexus, forcing a real-time reassessment and re-election mid-navigation.
-- **Realistic networking**: message latency, packet loss, and bandwidth limits between drones instead of instant, perfect delivery each tick.
-- **Byzantine fault tolerance**: handling a drone that's alive but sending bad/malicious election data, not just drones that go fully offline.
+- **Byzantine fault tolerance**: handling a drone that's alive but sending bad/malicious election data (a false candidacy, a forged heartbeat), not just drones that go fully offline.
 - **Physical demo**: porting the coordination logic onto real hardware (e.g., an ESP-NOW mesh across a few ESP32 boards) or a software-in-the-loop simulator like ArduPilot/Gazebo.
 
 ## License

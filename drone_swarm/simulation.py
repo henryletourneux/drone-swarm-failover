@@ -4,7 +4,7 @@ import math
 import random
 
 from .model import Drone
-from .swarm import Swarm
+from .swarm import Swarm, SwarmConfig
 
 DEFAULT_WIDTH = 800
 DEFAULT_HEIGHT = 500
@@ -16,6 +16,7 @@ def create_random_swarm(
     height: int = DEFAULT_HEIGHT,
     comm_range: float = 180.0,
     speed: float = 0.0,
+    config: SwarmConfig | None = None,
     seed: int | None = None,
 ) -> Swarm:
     """speed=0.0 (default) gives a static swarm, same as before movement
@@ -33,4 +34,4 @@ def create_random_swarm(
             vx=speed * math.cos(angle),
             vy=speed * math.sin(angle),
         ))
-    return Swarm(drones, comm_range=comm_range, width=width, height=height)
+    return Swarm(drones, comm_range=comm_range, width=width, height=height, config=config, seed=seed)

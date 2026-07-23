@@ -24,13 +24,10 @@ class Drone:
     vy: float = 0.0
 
     # Which drone this one currently believes is the nexus (coordinator).
+    # Synced each tick from this drone's NexusElection.known_nexus_id — the
+    # actual election bookkeeping (candidacy, term, timeouts) lives there,
+    # not here, since it's a message-passing state machine, not static data.
     nexus_id: str | None = None
-
-    # Election bookkeeping — the best (id, priority) this drone has seen
-    # so far during the current flood, and which round that flood is.
-    candidate_id: str | None = None
-    candidate_priority: float = -1.0
-    election_round: int = 0
 
     # Cosmetic, derived from graph position each tick: "nexus" | "relay" | "leaf" | "unassigned"
     role: str = "unassigned"

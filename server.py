@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from drone_swarm.simulation import create_random_swarm
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
-TICK_SECONDS = 0.3
+TICK_SECONDS = 0.4  # matches SwarmConfig.tick_dt_s default, so 1 real second ~= 1 simulated second
 
 swarm = create_random_swarm(speed=6.0, seed=None)
 connections: set = set()
@@ -57,6 +57,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+
+@app.middleware("http")
+async def no_cache(request, call_next):
+    # This is a small local dev project — a stale cached app.js after an
+    # edit is a much worse failure mode than the tiny perf cost of always
+    # refetching a few KB of static files.
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/")
