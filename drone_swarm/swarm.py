@@ -18,9 +18,11 @@ class Swarm:
     behavior this project is named for.
     """
 
-    def __init__(self, drones: list, comm_range: float):
+    def __init__(self, drones: list, comm_range: float, width: float = 800.0, height: float = 500.0):
         self.drones = {d.id: d for d in drones}
         self.comm_range = comm_range
+        self.width = width
+        self.height = height
         self.tick_count = 0
         self.event_log: list = []
 
@@ -43,6 +45,7 @@ class Swarm:
 
     def tick(self) -> None:
         self.tick_count += 1
+        self._move()
         adjacency = build_adjacency(self.drones, self.comm_range)
         components = connected_components(adjacency)
 
@@ -52,6 +55,19 @@ class Swarm:
         self._assign_roles(adjacency)
         if len(self.event_log) > MAX_EVENT_LOG:
             self.event_log = self.event_log[-MAX_EVENT_LOG:]
+
+    def _move(self) -> None:
+        for drone in self.drones.values():
+            if not drone.alive or (drone.vx == 0.0 and drone.vy == 0.0):
+                continue
+            drone.x += drone.vx
+            drone.y += drone.vy
+            if drone.x < 0.0 or drone.x > self.width:
+                drone.vx = -drone.vx
+                drone.x = max(0.0, min(self.width, drone.x))
+            if drone.y < 0.0 or drone.y > self.height:
+                drone.vy = -drone.vy
+                drone.y = max(0.0, min(self.height, drone.y))
 
     def _assign_roles(self, adjacency: dict) -> None:
         for drone in self.drones.values():

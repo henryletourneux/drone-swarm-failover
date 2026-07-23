@@ -18,6 +18,11 @@ class Drone:
     priority: float
     alive: bool = True
 
+    # Constant-velocity drift per tick; zero by default (stationary), so
+    # every hand-built Drone() in existing tests is unaffected.
+    vx: float = 0.0
+    vy: float = 0.0
+
     # Which drone this one currently believes is the nexus (coordinator).
     nexus_id: str | None = None
 

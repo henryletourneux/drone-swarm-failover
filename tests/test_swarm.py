@@ -1,4 +1,6 @@
+from drone_swarm.model import Drone
 from drone_swarm.simulation import create_random_swarm
+from drone_swarm.swarm import Swarm
 
 
 def _tick(swarm, n):
@@ -47,3 +49,23 @@ def test_killing_dead_drone_is_idempotent():
         if e["type"] == "drone_down" and e.get("drone") == victim
     ]
     assert len(down_events) == 1
+
+
+def test_moving_drone_travels_and_bounces_off_boundary():
+    drone = Drone(id="D0", x=95, y=50, priority=10, vx=10, vy=0)
+    swarm = Swarm([drone], comm_range=100, width=100, height=100)
+
+    swarm.tick()
+    assert drone.x == 100  # clamped at the right edge
+    assert drone.vx == -10  # velocity flipped
+
+    swarm.tick()
+    assert drone.x == 90  # now heading back left
+
+
+def test_stationary_drones_default_to_zero_velocity():
+    swarm = create_random_swarm(seed=42, speed=0.0)
+    positions_before = {d.id: (d.x, d.y) for d in swarm.drones.values()}
+    swarm.tick()
+    positions_after = {d.id: (d.x, d.y) for d in swarm.drones.values()}
+    assert positions_before == positions_after

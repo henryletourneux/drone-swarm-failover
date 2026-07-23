@@ -101,3 +101,36 @@ def test_partition_yields_independent_nexuses():
     for i in right:
         assert swarm.drones[i].nexus_id in right
     _assert_no_dead_nexus(swarm)
+
+
+def test_merging_swarms_run_a_runoff_not_arbitrary_pick():
+    # Two clusters, far enough apart to start disconnected, each settles
+    # on its own nexus independently.
+    left = [
+        Drone(id="L0", x=0, y=0, priority=10),
+        Drone(id="L1", x=20, y=0, priority=95),  # highest priority overall
+        Drone(id="L2", x=0, y=20, priority=15),
+    ]
+    right = [
+        Drone(id="R0", x=1000, y=0, priority=40),
+        Drone(id="R1", x=1020, y=0, priority=50),  # highest on the right, but not overall
+        Drone(id="R2", x=1000, y=20, priority=30),
+    ]
+    swarm = Swarm(left + right, comm_range=50)
+    _tick(swarm, 10)
+
+    assert all(d.nexus_id == "L1" for d in swarm.drones.values() if d.id in {"L0", "L1", "L2"})
+    assert all(d.nexus_id == "R1" for d in swarm.drones.values() if d.id in {"R0", "R1", "R2"})
+
+    # Now drift the right cluster back within range of the left one —
+    # both L1 and R1 are simultaneously self-confirmed nexuses this tick.
+    for drone_id in ("R0", "R1", "R2"):
+        swarm.drones[drone_id].x -= 990
+
+    _tick(swarm, 10)
+
+    # The higher-priority incumbent (L1) must win the runoff, and every
+    # drone in the now-merged group must agree — no arbitrary split.
+    assert all(d.nexus_id == "L1" for d in swarm.drones.values())
+    assert any(e["type"] == "swarms_merged" for e in swarm.event_log)
+    _assert_no_dead_nexus(swarm)

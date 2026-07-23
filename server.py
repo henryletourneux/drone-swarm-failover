@@ -20,9 +20,9 @@ from fastapi.staticfiles import StaticFiles
 from drone_swarm.simulation import create_random_swarm
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
-TICK_SECONDS = 0.5
+TICK_SECONDS = 0.3
 
-swarm = create_random_swarm(seed=None)
+swarm = create_random_swarm(speed=6.0, seed=None)
 connections: set = set()
 
 
@@ -83,4 +83,4 @@ def _handle_control_message(message: dict) -> None:
     if msg_type == "kill":
         swarm.kill(message.get("id", ""))
     elif msg_type == "reset":
-        swarm = create_random_swarm(seed=None)
+        swarm = create_random_swarm(speed=6.0, seed=None)

@@ -23,25 +23,32 @@ def _candidate_key(candidate_id: str, candidate_priority: float) -> tuple:
 
 def resolve_component(drones: dict, adjacency: dict, component: set, event_log: list, tick: int) -> None:
     """Bring one connected component one step closer to (or into) agreement
-    on a nexus. Mutates the drones in `component` in place."""
+    on a nexus. Mutates the drones in `component` in place.
 
-    incumbent = _find_incumbent(drones, component)
+    With mobile drones, two previously-separate (and separately settled)
+    swarms can drift back into range of each other. When that happens this
+    component briefly has *two* self-confirmed nexuses at once — a merge,
+    not a loss — and needs a runoff rather than either being blindly kept.
+    """
 
-    if incumbent is not None:
-        _sync_to_incumbent(drones, component, incumbent, event_log, tick)
+    incumbents = _find_incumbents(drones, component)
+
+    if len(incumbents) == 1:
+        _sync_to_incumbent(drones, component, incumbents[0], event_log, tick)
         return
 
-    _run_election_step(drones, adjacency, component, event_log, tick)
+    reason = "merge" if len(incumbents) > 1 else "loss"
+    _run_election_step(drones, adjacency, component, event_log, tick, reason, incumbents)
 
 
-def _find_incumbent(drones: dict, component: set) -> str | None:
-    """A drone in this component is the incumbent nexus if it is alive,
-    present in the component, and self-confirms (nexus_id == its own id)."""
-    for drone_id in component:
-        drone = drones[drone_id]
-        if drone.alive and drone.nexus_id == drone.id:
-            return drone_id
-    return None
+def _find_incumbents(drones: dict, component: set) -> list:
+    """Every drone in this component that is alive and self-confirms
+    (nexus_id == its own id). Normally at most one; more than one means
+    two formerly-separate groups just reconnected."""
+    return sorted(
+        drone_id for drone_id in component
+        if drones[drone_id].alive and drones[drone_id].nexus_id == drone_id
+    )
 
 
 def _sync_to_incumbent(drones: dict, component: set, incumbent: str, event_log: list, tick: int) -> None:
@@ -53,7 +60,15 @@ def _sync_to_incumbent(drones: dict, component: set, incumbent: str, event_log: 
         drone.candidate_priority = -1.0
 
 
-def _run_election_step(drones: dict, adjacency: dict, component: set, event_log: list, tick: int) -> None:
+def _run_election_step(
+    drones: dict,
+    adjacency: dict,
+    component: set,
+    event_log: list,
+    tick: int,
+    reason: str = "loss",
+    incumbents: list = (),
+) -> None:
     # Anyone in this component not already mid-election nominates itself.
     newly_started = []
     for drone_id in component:
@@ -63,7 +78,14 @@ def _run_election_step(drones: dict, adjacency: dict, component: set, event_log:
             drone.candidate_priority = drone.priority
             newly_started.append(drone_id)
 
-    if newly_started:
+    if newly_started and reason == "merge":
+        event_log.append({
+            "tick": tick,
+            "type": "swarms_merged",
+            "detail": f"{' and '.join(incumbents)} came back into range of each other — running a runoff",
+            "drones": sorted(newly_started),
+        })
+    elif newly_started:
         event_log.append({
             "tick": tick,
             "type": "election_started",
