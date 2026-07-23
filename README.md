@@ -1,8 +1,8 @@
 # Drone Swarm Failover
 
-A mesh network of simulated drones that elects a new coordinator ("nexus") whenever the current one goes down — and keeps doing it, no matter how many times you take out the new one. There's no central authority: the election spreads outward through the mesh one hop per tick, like ripples across a web, until every drone independently converges on the same winner.
+A mesh network of simulated drones that elects a new coordinator ("nexus") whenever the current one goes down, and keeps doing it ad nauseum ad infinitum, no matter how many times you take out the new one. There's no central authority: the election spreads outward through the mesh one hop per tick, like ripples across a spiders web or static electricity through your hair, until every drone independently converges on the same winner.
 
-Kill the nexus. Watch the swarm heal itself. Kill the replacement. Watch it happen again.
+Kill the nexus. Watch the swarm heal itself. Kill the replacement. Watch it happen again, pretty cool if i do say so myself.
 
 ## Why this exists
 
