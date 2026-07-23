@@ -46,7 +46,19 @@ source .venv/bin/activate
 python3 -m antagonist.cli
 ```
 
-It's also live in the browser demo — the **☠ Launch Attack** button throws a random attack from `antagonist/attacks.py` at the actual running swarm (which is why the live demo runs with `bft_mode=True` by default). Watch the Security stat climb, a red flash mark the targeted drone, and the elected nexus stay completely unaffected.
+It's also live in the browser demo, in **Security mode** (see Scaling below) — the **☠ Launch Attack** button throws a random attack from `antagonist/attacks.py` at the actual running swarm. Watch it play out on the canvas (a projectile flies in, impacts, a vignette pulse), the Security stat climb, and the elected nexus stay completely unaffected.
+
+## Scaling to 100 drones
+
+Two real, distinct bottlenecks turned up profiling this, worth documenting because the second one very nearly got papered over with a config tweak instead of actually fixed:
+
+1. **O(n) or O(n²) neighbor search.** Both `MeshNetwork.neighbors_of` and `topology.build_adjacency` originally checked every drone against every other drone to find who's in range — fine at 14 drones, measured at ~193ms/tick at 100 (a live demo needs to comfortably clear its tick budget many times over). Fixed with `drone_swarm/spatial_grid.py`, a uniform grid that buckets drones by cell so a query only checks nearby cells instead of the whole population — O(n) per tick instead of O(n²).
+2. **The real bottleneck, found by profiling *through* that fix and seeing barely any improvement:** `MeshNetwork`'s relay flood tracked `seen_by` per relay *path*, not globally per message. In a densely-connected mesh, the same broadcast reaches the same recipient via multiple different paths, and each redundant copy keeps relaying further — combinatorial blowup, not linear. Measured: one broadcast in a 14-drone fully-connected mesh produced ~5.8 million redundant sends over 50 ticks. Fixed by sharing one mutable `seen_by` set across every path for a given broadcast, marking a recipient "seen" only once a delivery to them actually succeeds (so a loss-dropped attempt doesn't block a *different* path from still reaching them — redundant paths keep their real benefit, resilience against packet loss, without the explosion). `tests/test_mesh_network.py` has a regression suite for this, independently re-verified by temporarily reintroducing the bug and confirming it reproduces the blowup before restoring the fix.
+
+With both fixed, 100 drones runs at single-digit milliseconds per tick in plain mode. `bft_mode` at 100 drones remains a real, harder frontier — Ed25519 verification cost scales with message *volume*, which still scales with connectivity density even after the fixes above, and a mesh sparse enough to keep that cheap looks fragmented and unimpressive, not sophisticated. Rather than fake it with a degraded mesh or a misleadingly slow cadence, the live demo has two honest, distinct modes instead of one compromise:
+
+- **⚡ Scale** (default) — 100 drones, plain mode, fast, richly connected (~6.5 average neighbors).
+- **🛡 Security** — 14 drones, `bft_mode` on, tuned to run comfortably, antagonist-ready.
 
 ### Movement
 
@@ -59,18 +71,20 @@ The mesh's actual geometric adjacency (`build_adjacency`/`connected_components`/
 ```
 drone_swarm/
   model.py          # Drone dataclass (pure data — no election bookkeeping)
+  spatial_grid.py    # uniform grid for O(n) proximity queries — see Scaling below
   topology.py        # adjacency / connected components / BFS — for visualization only
   protocol.py        # message schemas: NexusHeartbeat, ElectionMessage
   identity.py         # Ed25519 signing keys, credentials, SwarmAuthority — bft_mode only
   mesh_network.py   # range-limited mesh: latency, packet loss, multi-hop relay
   election.py        # NexusElection — per-drone heartbeat/term-based Bully algorithm
   swarm.py            # Swarm: owns drones, the mesh, and every drone's election state
+  metrics.py          # recovery time, election/message counters — see Metrics below
   simulation.py      # random swarm generator
   cli.py               # headless terminal demo, no server needed
 antagonist/          # adversarial testing tool — see the BFT section below
-server.py            # FastAPI + WebSocket server for the live browser demo
+server.py            # FastAPI + WebSocket server for the live browser demo (Scale / Security modes)
 frontend/            # canvas visualization (vanilla HTML/CSS/JS, no build step)
-tests/                 # pytest suite covering topology, election, swarm, and BFT behavior
+tests/                 # pytest suite covering topology, mesh, election, swarm, BFT, and metrics behavior
 ```
 
 ## Running it
@@ -93,7 +107,7 @@ source .venv/bin/activate    # if not already active
 uvicorn server:app --reload
 ```
 
-Then open **http://localhost:8000** in a browser. Click any drone to shoot it down and watch the swarm re-elect a nexus in real time. "Reset Swarm" spawns a fresh random layout.
+Then open **http://localhost:8000** in a browser. Click any drone to shoot it down and watch the swarm re-elect a nexus in real time. "Reset Swarm" spawns a fresh random layout in the current mode; the **⚡ Scale / 🛡 Security** toggle switches between the 100-drone and BFT-hardened demos (see Scaling below).
 
 ## Metrics
 
@@ -114,7 +128,10 @@ pytest
 ## Roadmap / possible extensions
 
 This project is deliberately scoped to a working, well-tested core first. Natural next steps if extended further:
-- **Obstacle course / objectives**: give the swarm a goal beyond just staying coordinated — navigate from start to end through obstacles and scripted "laser" hazards that pick off whichever drone is currently nexus, forcing a real-time reassessment and re-election mid-navigation.
+- **Obstacle course / objectives**: give the swarm a goal beyond just staying coordinated — navigate a randomized course with barriers and scripted "turret" hazards that pick off whichever drone is currently nexus, forcing a real-time reassessment and re-election mid-navigation. Resource/task allocation (which drones go where, under what constraints) is a genuinely new subsystem, not a small add-on.
+- **`bft_mode` at real scale**: closing the gap documented above — likely needs batching/amortizing verification rather than one Ed25519 op per message, not just more connectivity tuning.
+- **Rate limiting**: the antagonist's one documented, honest gap (flood/spam isn't currently mitigated at the resource level).
+- **Smarter resource allocation as the swarm scales**: starting with explainable, testable heuristics (e.g. weighted by position/load) rather than a trained model — the latter is closer to its own project than a feature.
 - **Extract `antagonist/` into its own project**: it's already scoped for this (see above) — a general-purpose adversarial mesh-network testing tool, not drone-specific in its core attack logic.
 - **Physical demo**: porting the coordination logic onto real hardware (e.g., an ESP-NOW mesh across a few ESP32 boards) or a software-in-the-loop simulator like ArduPilot/Gazebo.
 

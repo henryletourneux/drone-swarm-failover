@@ -36,11 +36,12 @@ body {
 .app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
   max-width: 1400px;
   margin: 0 auto;
-  padding: 24px;
-  gap: 18px;
+  padding: 14px 20px;
+  gap: 10px;
+  overflow: hidden; /* sized to fit a laptop screen without scrolling; see .stage/.stats tightening below */
 }
 
 /* Top bar */
@@ -49,20 +50,21 @@ body {
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 16px;
-  padding-bottom: 16px;
+  gap: 12px;
+  padding-bottom: 10px;
   border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .title-block h1 {
   margin: 0;
-  font-size: 1.6rem;
+  font-size: 1.3rem;
   font-weight: 700;
   letter-spacing: -0.02em;
 }
 
 .subtitle {
-  margin: 4px 0 0;
+  margin: 2px 0 0;
   color: var(--text-dim);
   font-family: var(--mono);
   font-size: 0.85rem;
@@ -102,6 +104,33 @@ button#attack-btn:hover { filter: brightness(1.1); box-shadow: 0 4px 18px rgba(2
 button#attack-btn:active { transform: translateY(1px); }
 button#reset-btn:active { transform: translateY(1px); }
 
+/* Mode toggle */
+.mode-toggle {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px;
+}
+.mode-btn {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.mode-btn:hover { color: var(--text); }
+.mode-btn--active {
+  color: var(--bg);
+  background: linear-gradient(180deg, #4cc7fb, #1ea7e6);
+}
+
 /* Connection indicator */
 .conn {
   display: inline-flex;
@@ -129,10 +158,10 @@ button#reset-btn:active { transform: translateY(1px); }
 /* Stage */
 .stage {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 18px;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 12px;
   flex: 1;
-  min-height: 0;
+  min-height: 0; /* let the grid shrink below content size -- .app's overflow:hidden is what actually prevents scrolling */
 }
 
 .canvas-wrap {
@@ -141,7 +170,7 @@ button#reset-btn:active { transform: translateY(1px); }
   border: 1px solid var(--border);
   border-radius: 14px;
   overflow: hidden;
-  min-height: 420px;
+  min-height: 220px; /* a floor for unusably-short windows, not a forced height */
 }
 
 canvas#swarm-canvas {
@@ -256,20 +285,21 @@ canvas#swarm-canvas {
 .stats {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 14px;
+  gap: 10px;
+  flex-shrink: 0;
 }
 .stat-tile {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 3px;
   background: var(--bg-panel);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 14px 16px;
+  border-radius: 10px;
+  padding: 8px 14px;
 }
 .stat-label {
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.64rem;
   text-transform: uppercase;
   letter-spacing: 0.12em;
   color: var(--text-dim);
@@ -279,7 +309,7 @@ canvas#swarm-canvas {
   align-items: baseline;
   gap: 8px;
   font-family: var(--mono);
-  font-size: 1.5rem;
+  font-size: 1.2rem;
   font-weight: 600;
   color: var(--text);
   line-height: 1.1;
@@ -312,8 +342,9 @@ canvas#swarm-canvas {
 .hint {
   color: var(--text-dim);
   font-family: var(--mono);
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   text-align: center;
+  flex-shrink: 0;
 }
 
 /* Scrollbar */

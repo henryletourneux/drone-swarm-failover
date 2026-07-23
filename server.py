@@ -25,20 +25,26 @@ from drone_swarm.swarm import SwarmConfig
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 TICK_SECONDS = 0.4  # matches SwarmConfig.tick_dt_s default, so 1 real second ~= 1 simulated second
 
-# bft_mode is on for the live demo specifically so the antagonist has real
-# defenses to demonstrate -- with it off, "Launch Attack" would have nothing
-# to visibly block. max_relay_hops is lowered from the default of 4: in a
-# 14-drone swarm this size, almost everyone is already directly reachable,
-# so the extra hops were mostly redundant re-verification of the same
-# messages -- measured at ~113x more per-tick cost than plain mode (up to
-# ~230ms/tick, enough to peg a full CPU core against the 400ms tick budget).
-# hops=2 keeps real multi-hop relay behavior exercised while cutting that to
-# a small fraction of the tick budget even during heavy election activity.
-LIVE_CONFIG = SwarmConfig(bft_mode=True, max_relay_hops=2)
-
-swarm = create_random_swarm(speed=6.0, config=LIVE_CONFIG, seed=None)
-adversary = Antagonist(swarm)  # installs a bounded passive wiretap on swarm.mesh
-connections: set = set()
+# Two distinct live-demo modes, not one compromise config. Profiling found a
+# real tension: Ed25519 verification cost scales with message *volume*
+# (roughly messages_delivered), which scales combinatorially with
+# connectivity density x drone count. At 100 drones, keeping bft_mode fast
+# required sparsifying the mesh down to ~1.6 average neighbors (many
+# isolated pairs -- a fragmented, unimpressive mesh), while a genuinely
+# richly-connected mesh (avg degree ~5) under bft_mode measured ~700ms/tick,
+# far too slow for smooth interactivity at any reasonable cadence. Rather
+# than fake it with a degraded mesh, each mode gets the config it's
+# actually good at:
+#   scale    -- 100 drones, plain mode, dense/rich connectivity, fast.
+#   security -- 14 drones, bft_mode on, the antagonist has real defenses to
+#               demonstrate, already tuned to run comfortably.
+MODE_SPECS = {
+    "scale": dict(n=100, width=1400, height=900, comm_range=180,
+                  config=SwarmConfig(max_relay_hops=2)),
+    "security": dict(n=14, width=800, height=500, comm_range=180,
+                      config=SwarmConfig(bft_mode=True, max_relay_hops=2)),
+}
+DEFAULT_MODE = "scale"
 
 ATTACK_CHOICES = (
     "impersonation",
@@ -51,6 +57,20 @@ ATTACK_CHOICES = (
 )
 
 
+def _build_swarm(selected_mode: str):
+    spec = MODE_SPECS[selected_mode]
+    return create_random_swarm(
+        n=spec["n"], width=spec["width"], height=spec["height"],
+        comm_range=spec["comm_range"], speed=6.0, config=spec["config"], seed=None,
+    )
+
+
+mode = DEFAULT_MODE
+swarm = _build_swarm(mode)
+adversary = Antagonist(swarm)  # installs a bounded passive wiretap on swarm.mesh; harmless if bft_mode is off
+connections: set = set()
+
+
 async def simulation_loop() -> None:
     while True:
         await asyncio.sleep(TICK_SECONDS)
@@ -61,7 +81,7 @@ async def simulation_loop() -> None:
 async def _broadcast_state() -> None:
     if not connections:
         return
-    state = swarm.to_state_dict()
+    state = _state_payload()
     dead = set()
     for ws in connections:
         try:
@@ -69,6 +89,12 @@ async def _broadcast_state() -> None:
         except Exception:
             dead.add(ws)
     connections.difference_update(dead)
+
+
+def _state_payload() -> dict:
+    state = swarm.to_state_dict()
+    state["mode"] = mode
+    return state
 
 
 @asynccontextmanager
@@ -104,7 +130,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     connections.add(websocket)
     try:
-        await websocket.send_json(swarm.to_state_dict())
+        await websocket.send_json(_state_payload())
         while True:
             message = await websocket.receive_json()
             _handle_control_message(message)
@@ -113,12 +139,15 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
 
 def _handle_control_message(message: dict) -> None:
-    global swarm, adversary
+    global swarm, adversary, mode
     msg_type = message.get("type")
     if msg_type == "kill":
         swarm.kill(message.get("id", ""))
     elif msg_type == "reset":
-        swarm = create_random_swarm(speed=6.0, config=LIVE_CONFIG, seed=None)
+        requested_mode = message.get("mode")
+        if requested_mode in MODE_SPECS:
+            mode = requested_mode
+        swarm = _build_swarm(mode)
         adversary = Antagonist(swarm)
     elif msg_type == "attack":
         _launch_random_attack()
@@ -136,7 +165,17 @@ def _launch_random_attack() -> None:
     live swarm (the current nexus if one exists, else any alive drone), then
     logs it to the event log so it's visible in the demo. Whether it actually
     lands is left entirely to the swarm's real bft_mode defenses -- this
-    function makes no assumption about the outcome."""
+    function makes no assumption about the outcome.
+
+    A no-op outside "security" mode: without bft_mode, verification always
+    passes (see election.py), so a forged message would actually be
+    ADOPTED rather than blocked -- attacking an undefended swarm doesn't
+    demonstrate anything, it's just misleading. The frontend hides the
+    attack control outside security mode too; this is the defense-in-depth
+    backstop.
+    """
+    if not swarm.config.bft_mode:
+        return
     alive = [d for d in swarm.drones.values() if d.alive]
     if not alive:
         return

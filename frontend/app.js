@@ -1,8 +1,11 @@
 "use strict";
 
-// Fixed backend coordinate space (see drone_swarm/simulation.py).
-const WORLD_W = 800;
-const WORLD_H = 500;
+// Backend coordinate space — differs by demo mode (100-drone "scale" mode
+// uses a larger arena than the 14-drone "security" mode), so these are read
+// from the first field of each state message ("world": {width, height})
+// rather than hardcoded. Defaults here only matter before the first message.
+let WORLD_W = 800;
+let WORLD_H = 500;
 
 const ROLE_STYLE = {
   nexus: { fill: "#ffcb2b", stroke: "#fff1b8", radius: 16, glow: "#ffcb2b" },
@@ -18,6 +21,8 @@ const aliveValue = document.getElementById("alive-value");
 const logEl = document.getElementById("event-log");
 const resetBtn = document.getElementById("reset-btn");
 const attackBtn = document.getElementById("attack-btn");
+const modeScaleBtn = document.getElementById("mode-scale-btn");
+const modeSecurityBtn = document.getElementById("mode-security-btn");
 const connEl = document.getElementById("conn-indicator");
 const connLabel = document.getElementById("conn-label");
 
@@ -371,6 +376,22 @@ canvas.addEventListener("click", (e) => {
 
 resetBtn.addEventListener("click", () => send({ type: "reset" }));
 attackBtn.addEventListener("click", () => send({ type: "attack" }));
+modeScaleBtn.addEventListener("click", () => send({ type: "reset", mode: "scale" }));
+modeSecurityBtn.addEventListener("click", () => send({ type: "reset", mode: "security" }));
+
+// Reflects the active demo mode: highlights the current mode button, and
+// hides the attack control outside "security" mode -- without bft_mode,
+// a forged message would actually be ADOPTED rather than blocked (see
+// server.py's _launch_random_attack), so showing "Launch Attack" there
+// would be actively misleading, not just inert.
+let lastRenderedMode = null;
+function renderModeUI() {
+  if (state.mode === lastRenderedMode) return;
+  lastRenderedMode = state.mode;
+  modeScaleBtn.classList.toggle("mode-btn--active", state.mode === "scale");
+  modeSecurityBtn.classList.toggle("mode-btn--active", state.mode === "security");
+  attackBtn.style.display = state.mode === "security" ? "" : "none";
+}
 
 // --- Event log --------------------------------------------------------------
 
@@ -501,6 +522,16 @@ function connect() {
       seenEventKeys.clear();
       logEl.innerHTML = "";
     }
+
+    if (state.world && (state.world.width !== WORLD_W || state.world.height !== WORLD_H)) {
+      // Different demo mode -> different arena size. Recompute the
+      // canvas scale/offset for the new world immediately.
+      WORLD_W = state.world.width;
+      WORLD_H = state.world.height;
+      resizeCanvas();
+    }
+
+    renderModeUI();
 
     // Wherever the interpolation currently is (not necessarily fully
     // caught up yet) becomes the new starting point, so a message that
