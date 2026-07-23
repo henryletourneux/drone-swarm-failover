@@ -24,7 +24,6 @@ let state = { tick: 0, drones: [], edges: [], event_log: [] };
 let socket = null;
 let hoverId = null;
 let reconnectTimer = null;
-let animPhase = 0; // for the pulsing nexus ring
 
 // --- Layout / scaling -------------------------------------------------------
 
@@ -112,19 +111,23 @@ function drawDrone(d) {
     return;
   }
 
-  // Pulsing ring for the nexus.
+  // Static ring calling out the nexus (previously an animated pulse, which
+  // needed a continuously-running timer for no real benefit, and whose
+  // outer radius reached beyond the actual clickable hit-test area).
   if (d.role === "nexus") {
-    const pulse = (Math.sin(animPhase) + 1) / 2; // 0..1
-    ctx.strokeStyle = `rgba(255, 203, 43, ${0.15 + pulse * 0.4})`;
+    ctx.strokeStyle = "rgba(255, 203, 43, 0.4)";
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, r + 6 + pulse * 6, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, r + 8, 0, Math.PI * 2);
     ctx.stroke();
   }
 
-  if (style.glow) {
+  // shadowBlur is expensive to run every frame for every drone, so only
+  // the nexus (the one node worth calling out) gets it — everyone else
+  // is already visually distinct by size/color alone.
+  if (d.role === "nexus") {
     ctx.shadowColor = style.glow;
-    ctx.shadowBlur = d.role === "nexus" ? 22 : 12;
+    ctx.shadowBlur = 16;
   }
   ctx.fillStyle = style.fill;
   ctx.beginPath();
@@ -174,7 +177,10 @@ function droneAt(clientX, clientY) {
     const d = state.drones[i];
     if (!d.alive) continue;
     const p = worldToScreen(d.x, d.y);
-    const r = (ROLE_STYLE[d.role] || ROLE_STYLE.leaf).radius + 4;
+    // +10 padding (rather than the visual fill radius alone) so the
+    // clickable area comfortably covers the nexus's outer ring too,
+    // and gives every drone a slightly more forgiving click target.
+    const r = (ROLE_STYLE[d.role] || ROLE_STYLE.leaf).radius + 10;
     const dx = mx - p.x;
     const dy = my - p.y;
     if (dx * dx + dy * dy <= r * r) return d;
@@ -213,25 +219,49 @@ const EV_LABEL = {
   drone_down: "DOWN",
   election_started: "ELECT",
   election_won: "WON",
+  swarms_merged: "MERGE",
 };
 
+const MAX_LOG_ROWS = 18;
+const seenEventKeys = new Set();
+
+function eventKey(ev) {
+  return `${ev.tick}:${ev.type}:${ev.detail}`;
+}
+
+// Only ever inserts genuinely new events (newest at top, slide-in
+// animation plays once for that row) and silently trims old ones off the
+// bottom — previously this cleared and rebuilt all 18 rows on every
+// single update, replaying the animation on unchanged rows too, which is
+// what made it look like constant flashing.
 function renderLog() {
-  logEl.innerHTML = "";
-  const events = (state.event_log || []).slice(-18).reverse();
-  if (events.length === 0) {
-    const li = document.createElement("li");
-    li.className = "ev-empty";
-    li.textContent = "Swarm nominal — no events yet.";
-    logEl.appendChild(li);
-    return;
-  }
+  const events = state.event_log || [];
+  const emptyPlaceholder = logEl.querySelector(".ev-empty");
+
   for (const ev of events) {
+    const key = eventKey(ev);
+    if (seenEventKeys.has(key)) continue;
+    seenEventKeys.add(key);
+
+    if (emptyPlaceholder) emptyPlaceholder.remove();
+
     const li = document.createElement("li");
     li.className = "ev--" + ev.type;
     const tag = EV_LABEL[ev.type] || ev.type;
     li.innerHTML =
       `<span class="ev-tick">t${ev.tick}</span>` +
       `<span class="ev-detail">[${tag}] ${escapeHtml(ev.detail)}</span>`;
+    logEl.insertBefore(li, logEl.firstChild);
+  }
+
+  while (logEl.children.length > MAX_LOG_ROWS) {
+    logEl.removeChild(logEl.lastChild);
+  }
+
+  if (logEl.children.length === 0) {
+    const li = document.createElement("li");
+    li.className = "ev-empty";
+    li.textContent = "Swarm nominal — no events yet.";
     logEl.appendChild(li);
   }
 }
@@ -257,10 +287,19 @@ function connect() {
   socket.addEventListener("open", () => setConn("connected", "live"));
 
   socket.addEventListener("message", (e) => {
+    const previousTick = state.tick;
     try {
       state = JSON.parse(e.data);
     } catch (err) {
       return;
+    }
+    if (state.tick < previousTick) {
+      // Tick count went backwards: the swarm was reset. Old event keys
+      // are no longer valid (tick numbers restarted from 1), so drop
+      // them and clear the log rather than risk skipping new events
+      // that happen to collide with pre-reset ones.
+      seenEventKeys.clear();
+      logEl.innerHTML = "";
     }
     tickValue.textContent = state.tick;
     aliveValue.textContent = state.drones.filter((d) => d.alive).length;
@@ -287,14 +326,9 @@ function send(obj) {
 
 // --- Boot -------------------------------------------------------------------
 
+// No continuously-running render loop at all: the canvas only redraws in
+// response to an actual event (a new WebSocket message, a resize, or a
+// hover change), so there's zero JS work happening between real updates.
 window.addEventListener("resize", resizeCanvas);
-// Gentle animation loop just for the nexus pulse (state comes from the socket).
-function animate() {
-  animPhase += 0.06;
-  draw();
-  requestAnimationFrame(animate);
-}
-
 resizeCanvas();
 connect();
-requestAnimationFrame(animate);
