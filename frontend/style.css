@@ -74,20 +74,32 @@ body {
   gap: 14px;
 }
 
-button#reset-btn {
+button#reset-btn,
+button#attack-btn {
   font-family: var(--sans);
   font-weight: 600;
   font-size: 0.9rem;
-  color: var(--bg);
-  background: linear-gradient(180deg, #4cc7fb, #1ea7e6);
   border: none;
   border-radius: 8px;
   padding: 9px 18px;
   cursor: pointer;
   transition: transform 0.08s ease, box-shadow 0.15s ease, filter 0.15s ease;
+}
+
+button#reset-btn {
+  color: var(--bg);
+  background: linear-gradient(180deg, #4cc7fb, #1ea7e6);
   box-shadow: 0 2px 12px rgba(56, 189, 248, 0.25);
 }
 button#reset-btn:hover { filter: brightness(1.08); box-shadow: 0 4px 18px rgba(56, 189, 248, 0.4); }
+
+button#attack-btn {
+  color: #ffe3e0;
+  background: linear-gradient(180deg, #ff6b5e, #c7392e);
+  box-shadow: 0 2px 12px rgba(255, 107, 94, 0.3);
+}
+button#attack-btn:hover { filter: brightness(1.1); box-shadow: 0 4px 18px rgba(255, 107, 94, 0.5); }
+button#attack-btn:active { transform: translateY(1px); }
 button#reset-btn:active { transform: translateY(1px); }
 
 /* Connection indicator */
@@ -225,6 +237,19 @@ canvas#swarm-canvas {
 .ev--election_started .ev-detail { color: #ffd873; }
 .ev--election_won { border-left-color: var(--won); }
 .ev--election_won .ev-detail { color: #86efac; }
+.ev--attack {
+  border-left-color: #ff3b3b;
+  background: rgba(255, 59, 59, 0.08);
+  animation: slidein 0.25s ease, attack-shake 0.35s ease;
+}
+.ev--attack .ev-detail { color: #ff8f87; font-weight: 600; }
+@keyframes attack-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-3px); }
+  40% { transform: translateX(3px); }
+  60% { transform: translateX(-2px); }
+  80% { transform: translateX(2px); }
+}
 .ev-empty { color: var(--text-dim); font-style: italic; }
 
 /* Stats strip */

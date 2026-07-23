@@ -42,7 +42,14 @@ class MeshWiretap:
     crosses the mesh is recorded, without altering delivery in any way. This
     models a listener with an antenna -- it only ever reads what is already
     being transmitted in the clear, which is how the attacker learns the
-    current nexus/term and captures genuinely-signed messages to replay."""
+    current nexus/term and captures genuinely-signed messages to replay.
+
+    Capped at `MAX_CAPTURED` (keeping the most recent) so this stays safe to
+    attach to a long-running swarm (e.g. a live server), not just a short
+    one-shot CLI campaign -- an unbounded capture list would otherwise grow
+    for as long as the process stays up."""
+
+    MAX_CAPTURED = 200
 
     def __init__(self, swarm) -> None:
         self._swarm = swarm
@@ -51,6 +58,8 @@ class MeshWiretap:
 
         def tapped(message, now_s):
             self.captured.append(message)
+            if len(self.captured) > self.MAX_CAPTURED:
+                del self.captured[: len(self.captured) - self.MAX_CAPTURED]
             return self._real_broadcast(message, now_s)
 
         swarm.mesh.broadcast = tapped

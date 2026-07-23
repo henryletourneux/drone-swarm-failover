@@ -46,6 +46,8 @@ source .venv/bin/activate
 python3 -m antagonist.cli
 ```
 
+It's also live in the browser demo — the **☠ Launch Attack** button throws a random attack from `antagonist/attacks.py` at the actual running swarm (which is why the live demo runs with `bft_mode=True` by default). Watch the Security stat climb, a red flash mark the targeted drone, and the elected nexus stay completely unaffected.
+
 ### Movement
 
 Drones aren't pinned in place — each one drifts at a constant velocity and bounces off the arena's edges (`Swarm._move`, run at the start of every tick, before positions sync to the mesh). This is what makes partitions and merges an ongoing, organic part of watching the demo rather than something you can only trigger by clicking — swarms split and reconverge on their own as drones wander in and out of range.

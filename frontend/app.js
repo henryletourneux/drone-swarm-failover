@@ -17,6 +17,7 @@ const tickValue = document.getElementById("tick-value");
 const aliveValue = document.getElementById("alive-value");
 const logEl = document.getElementById("event-log");
 const resetBtn = document.getElementById("reset-btn");
+const attackBtn = document.getElementById("attack-btn");
 const connEl = document.getElementById("conn-indicator");
 const connLabel = document.getElementById("conn-label");
 
@@ -39,6 +40,12 @@ let state = { tick: 0, drones: [], edges: [], event_log: [] };
 let socket = null;
 let hoverId = null;
 let reconnectTimer = null;
+
+// A brief red flash drawn over whichever drone the last antagonist attack
+// targeted, so a thrown-and-blocked attack is visible on the canvas itself,
+// not just in the event log / security stat. Purely cosmetic client state.
+const ATTACK_FLASH_MS = 1100;
+let activeAttackFlash = null; // {droneId, startTime}
 
 // --- Position interpolation --------------------------------------------------
 //
@@ -119,6 +126,43 @@ function draw() {
   for (const d of drones) {
     drawDrone(d);
   }
+
+  // Antagonist attack flash, drawn on top so it's always visible.
+  if (activeAttackFlash) {
+    const elapsed = performance.now() - activeAttackFlash.startTime;
+    if (elapsed > ATTACK_FLASH_MS) {
+      activeAttackFlash = null;
+    } else {
+      const target = byId[activeAttackFlash.droneId];
+      if (target) drawAttackFlash(target, elapsed / ATTACK_FLASH_MS);
+    }
+  }
+}
+
+function drawAttackFlash(d, t) {
+  const p = worldToScreen(d.x, d.y);
+  const alpha = 1 - t;
+  const radius = 14 + t * 40;
+
+  ctx.save();
+  ctx.strokeStyle = `rgba(255, 59, 59, ${alpha * 0.85})`;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.strokeStyle = `rgba(255, 140, 130, ${alpha * 0.6})`;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, radius * 0.6, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.globalAlpha = alpha;
+  ctx.font = "16px system-ui, -apple-system, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText("☠", p.x, p.y - 22 - t * 10);
+  ctx.restore();
 }
 
 function drawDrone(d) {
@@ -254,6 +298,7 @@ canvas.addEventListener("click", (e) => {
 });
 
 resetBtn.addEventListener("click", () => send({ type: "reset" }));
+attackBtn.addEventListener("click", () => send({ type: "attack" }));
 
 // --- Event log --------------------------------------------------------------
 
@@ -262,6 +307,7 @@ const EV_LABEL = {
   election_started: "ELECT",
   election_won: "WON",
   swarms_merged: "MERGE",
+  attack: "ATTACK",
 };
 
 const MAX_LOG_ROWS = 18;
@@ -284,6 +330,10 @@ function renderLog() {
     const key = eventKey(ev);
     if (seenEventKeys.has(key)) continue;
     seenEventKeys.add(key);
+
+    if (ev.type === "attack" && ev.drone) {
+      activeAttackFlash = { droneId: ev.drone, startTime: performance.now() };
+    }
 
     if (emptyPlaceholder) emptyPlaceholder.remove();
 
