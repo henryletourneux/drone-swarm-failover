@@ -124,6 +124,10 @@ class NexusElection:
         self._registry = registry  # IdentityRegistry, shared read-only across the swarm
         self._total_swarm_size = total_swarm_size
         self._quorum_certificate: tuple = ()
+        # bft_mode only: how many incoming messages this drone has dropped
+        # for failing signature/credential/quorum verification. Public
+        # (not underscore-prefixed) since metrics.py reads it directly.
+        self.rejected_message_count = 0
 
         self.role: ElectionRole = ElectionRole.FOLLOWER
         self.known_nexus_id: str | None = None
@@ -202,6 +206,7 @@ class NexusElection:
             if not isinstance(msg, NexusHeartbeat) or msg.sender_id == self_id:
                 continue
             if not self._verify_heartbeat(msg):
+                self.rejected_message_count += 1
                 continue  # unsigned, forged, or an unproven term jump -- dropped
             newer_term = msg.term > self.term
             same_term_ok = msg.term == self.term and (
@@ -222,6 +227,7 @@ class NexusElection:
             if not isinstance(msg, ElectionMessage) or msg.sender_id == self_id:
                 continue
             if not self._verify_election_message(msg):
+                self.rejected_message_count += 1
                 continue  # unsigned, forged, or an uncertified priority claim -- dropped
             if msg.term < self.term:
                 continue  # stale election for an already-decided term

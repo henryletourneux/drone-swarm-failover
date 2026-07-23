@@ -20,6 +20,21 @@ const resetBtn = document.getElementById("reset-btn");
 const connEl = document.getElementById("conn-indicator");
 const connLabel = document.getElementById("conn-label");
 
+const stat = {
+  recoveryMean: document.getElementById("stat-recovery-mean"),
+  recoveryP95: document.getElementById("stat-recovery-p95"),
+  recoveryN: document.getElementById("stat-recovery-n"),
+  electWon: document.getElementById("stat-elect-won"),
+  electStarted: document.getElementById("stat-elect-started"),
+  merges: document.getElementById("stat-merges"),
+  msgSent: document.getElementById("stat-msg-sent"),
+  msgDelivered: document.getElementById("stat-msg-delivered"),
+  msgDropped: document.getElementById("stat-msg-dropped"),
+  security: document.getElementById("stat-security"),
+  securitySub: document.getElementById("stat-security-sub"),
+  securityTile: document.getElementById("stat-security-tile"),
+};
+
 let state = { tick: 0, drones: [], edges: [], event_log: [] };
 let socket = null;
 let hoverId = null;
@@ -293,6 +308,42 @@ function renderLog() {
   }
 }
 
+// --- Metrics ----------------------------------------------------------------
+
+const DASH = "—"; // em dash, for null/absent values
+
+function fmtInt(n) {
+  return typeof n === "number" ? n.toLocaleString("en-US") : "0";
+}
+
+function fmtSeconds(s) {
+  return typeof s === "number" ? s.toFixed(2) + "s" : DASH;
+}
+
+function renderMetrics() {
+  const m = state.metrics;
+  if (!m) return;
+
+  const rec = m.recovery || {};
+  stat.recoveryMean.textContent = fmtSeconds(rec.mean_s);
+  stat.recoveryP95.textContent = fmtSeconds(rec.p95_s);
+  stat.recoveryN.textContent = "n=" + (rec.count || 0);
+
+  stat.electWon.textContent = fmtInt(m.elections_won);
+  stat.electStarted.textContent = fmtInt(m.elections_started);
+  stat.merges.textContent = fmtInt(m.merges);
+
+  stat.msgSent.textContent = fmtInt(m.messages_sent);
+  stat.msgDelivered.textContent = fmtInt(m.messages_delivered);
+  stat.msgDropped.textContent = fmtInt(m.messages_dropped_loss);
+
+  const rej = m.security_rejections || 0;
+  stat.security.textContent = fmtInt(rej);
+  const attacked = rej > 0;
+  stat.securityTile.classList.toggle("is-alert", attacked);
+  stat.securitySub.textContent = attacked ? "rejected · under attack" : "no BFT activity";
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
@@ -339,6 +390,7 @@ function connect() {
     tickValue.textContent = state.tick;
     aliveValue.textContent = state.drones.filter((d) => d.alive).length;
     renderLog();
+    renderMetrics();
   });
 
   socket.addEventListener("close", () => {

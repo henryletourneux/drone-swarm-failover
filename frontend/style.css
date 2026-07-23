@@ -227,6 +227,63 @@ canvas#swarm-canvas {
 .ev--election_won .ev-detail { color: #86efac; }
 .ev-empty { color: var(--text-dim); font-style: italic; }
 
+/* Stats strip */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+}
+.stat-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+.stat-label {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-dim);
+}
+.stat-main {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.1;
+}
+.stat-main .stat-unit {
+  font-size: 0.7rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+}
+.stat-sub {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  color: var(--text-dim);
+}
+.stat-sub span { color: var(--accent); }
+/* Security tile stays unremarkable at 0, turns alarming only under attack. */
+#stat-security-tile.is-alert {
+  border-color: rgba(255, 107, 94, 0.55);
+  background: rgba(255, 107, 94, 0.06);
+}
+#stat-security-tile.is-alert .stat-main,
+#stat-security-tile.is-alert #stat-security-sub { color: var(--down); }
+
+@media (max-width: 860px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+}
+
 .hint {
   color: var(--text-dim);
   font-family: var(--mono);

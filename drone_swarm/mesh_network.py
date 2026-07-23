@@ -49,6 +49,13 @@ class MeshNetwork:
         self._alive: set = set()
         self._queue: list = []
 
+        # Message-volume counters for metrics.py -- counted per (message,
+        # recipient) transmission attempt, including relay hops, since
+        # that's what actually reflects radio traffic/bandwidth cost.
+        self.sent_count = 0
+        self.delivered_count = 0
+        self.dropped_loss_count = 0
+
     def update_known_position(self, drone_id: str, x: float, y: float, alive: bool) -> None:
         self._positions[drone_id] = (x, y)
         if alive:
@@ -87,7 +94,9 @@ class MeshNetwork:
         for recipient_id in self.neighbors_of(relaying_from):
             if recipient_id in already_seen:
                 continue
+            self.sent_count += 1
             if self._rng.random() < self.packet_loss_rate:
+                self.dropped_loss_count += 1
                 continue  # dropped packet
             self._queue.append(_InFlightMessage(
                 message=message,
@@ -108,6 +117,7 @@ class MeshNetwork:
         for item in self._queue:
             if item.deliver_at_s <= now_s and item.recipient_id in self._alive:
                 delivered.setdefault(item.recipient_id, []).append(item.message)
+                self.delivered_count += 1
                 if item.hops_remaining > 0:
                     self._enqueue_to_neighbors(
                         item.message,

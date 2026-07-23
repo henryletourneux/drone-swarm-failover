@@ -54,6 +54,25 @@ def run(n_drones: int, n_kills: int, seed: int | None) -> None:
     for event in swarm.event_log:
         print(f"  t={event['tick']:>3}  {event['type']:<16} {event['detail']}")
 
+    print("\nMetrics:")
+    m = swarm.metrics_snapshot()
+    recovery = m["recovery"]
+    if recovery["count"]:
+        print(
+            f"  Recovery time (per-drone, time without a known nexus): "
+            f"n={recovery['count']}  mean={recovery['mean_s']}s  "
+            f"p50={recovery['p50_s']}s  p95={recovery['p95_s']}s  max={recovery['max_s']}s"
+        )
+    else:
+        print("  Recovery time: no completed outages observed.")
+    print(f"  Elections started: {m['elections_started']}   Elections won: {m['elections_won']}   Merges: {m['merges']}")
+    print(
+        f"  Messages sent: {m['messages_sent']}   delivered: {m['messages_delivered']}   "
+        f"dropped to loss: {m['messages_dropped_loss']}"
+    )
+    if swarm.config.bft_mode:
+        print(f"  Security rejections (bft_mode): {m['security_rejections']}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Drone swarm failover demo")

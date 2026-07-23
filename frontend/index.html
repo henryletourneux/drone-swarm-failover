@@ -42,6 +42,29 @@
       </aside>
     </main>
 
+    <section class="stats" aria-label="Swarm metrics">
+      <div class="stat-tile">
+        <span class="stat-label">Recovery time</span>
+        <span class="stat-main"><span id="stat-recovery-mean">—</span><span class="stat-unit">mean</span></span>
+        <span class="stat-sub"><span id="stat-recovery-p95">—</span> p95 · <span id="stat-recovery-n">n=0</span></span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Elections</span>
+        <span class="stat-main"><span id="stat-elect-won">0</span><span class="stat-unit">won</span></span>
+        <span class="stat-sub"><span id="stat-elect-started">0</span> started · <span id="stat-merges">0</span> merges</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Messages</span>
+        <span class="stat-main"><span id="stat-msg-sent">0</span><span class="stat-unit">sent</span></span>
+        <span class="stat-sub"><span id="stat-msg-delivered">0</span> delivered · <span id="stat-msg-dropped">0</span> dropped</span>
+      </div>
+      <div class="stat-tile" id="stat-security-tile">
+        <span class="stat-label">Security rejections</span>
+        <span class="stat-main"><span id="stat-security">0</span></span>
+        <span class="stat-sub" id="stat-security-sub">no BFT activity</span>
+      </div>
+    </section>
+
     <footer class="hint">Click any live drone to shoot it down.</footer>
   </div>
   <script src="/static/app.js?v=3"></script>

@@ -93,6 +93,15 @@ uvicorn server:app --reload
 
 Then open **http://localhost:8000** in a browser. Click any drone to shoot it down and watch the swarm re-elect a nexus in real time. "Reset Swarm" spawns a fresh random layout.
 
+## Metrics
+
+The swarm is something you can measure, not just watch — `drone_swarm/metrics.py`, surfaced live in the browser demo's stats strip and printed at the end of every CLI run:
+
+- **Recovery time** — mean/p50/p95/max of, per drone, how long it went without a known nexus. Deliberately a *per-drone* quantity rather than a single swarm-wide "time to recovery": with multiple drones, partitions, and concurrent campaigns there's no single unambiguous way to match a specific nexus death to the specific election that "recovered" from it, but each drone's own gap between losing and regaining a known nexus is precisely and honestly computable from its own state transitions.
+- **Elections started / won, and merges** — cross-checked in tests against the event log's own tallies as an independent consistency check, not just trusted from the counting logic alone.
+- **Message volume** — sent / delivered / dropped-to-loss, counted per (message, recipient) transmission attempt including relay hops, since that's what actually reflects radio traffic.
+- **Security rejections** (`bft_mode`) — how many incoming messages a drone has dropped for failing signature/credential/quorum verification. Ties directly into the antagonist: run it against a swarm and watch this counter climb in real time as each attack is thrown and blocked.
+
 ### Running the tests
 
 ```bash
@@ -104,7 +113,6 @@ pytest
 
 This project is deliberately scoped to a working, well-tested core first. Natural next steps if extended further:
 - **Obstacle course / objectives**: give the swarm a goal beyond just staying coordinated — navigate from start to end through obstacles and scripted "laser" hazards that pick off whichever drone is currently nexus, forcing a real-time reassessment and re-election mid-navigation.
-- **Observability / metrics**: mean time to recovery, election frequency, message overhead under packet loss — turning it from "a demo" into "a system you can measure."
 - **Extract `antagonist/` into its own project**: it's already scoped for this (see above) — a general-purpose adversarial mesh-network testing tool, not drone-specific in its core attack logic.
 - **Physical demo**: porting the coordination logic onto real hardware (e.g., an ESP-NOW mesh across a few ESP32 boards) or a software-in-the-loop simulator like ArduPilot/Gazebo.
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from .election import ElectionRole, NexusElection
 from .identity import DroneIdentity, IdentityRegistry, SwarmAuthority
 from .mesh_network import MeshNetwork
+from .metrics import SwarmMetrics
 from .topology import build_adjacency
 
 MAX_EVENT_LOG = 200
@@ -66,6 +67,8 @@ class Swarm:
         self.time_s = 0.0
         self.tick_count = 0
         self.event_log: list = []
+        self.metrics = SwarmMetrics()
+        self._nexus_gap_start: dict = {}
 
         self.mesh = MeshNetwork(
             comm_range=comm_range,
@@ -153,7 +156,9 @@ class Swarm:
                 continue
             election = self.elections[drone_id]
             drone.nexus_id = election.known_nexus_id
-            self._log_transition(drone_id, previous_states.get(drone_id), election)
+            previous = previous_states.get(drone_id)
+            self._log_transition(drone_id, previous, election)
+            self._track_recovery(drone_id, previous, election)
 
         adjacency = build_adjacency(self.drones, self.comm_range)
         self._assign_roles(adjacency)
@@ -167,6 +172,7 @@ class Swarm:
         prev_role, _ = previous
 
         if prev_role != ElectionRole.CANDIDATE and election.role == ElectionRole.CANDIDATE:
+            self.metrics.elections_started += 1
             self.event_log.append({
                 "tick": self.tick_count,
                 "type": "election_started",
@@ -174,6 +180,7 @@ class Swarm:
                 "drones": [drone_id],
             })
         elif prev_role == ElectionRole.CANDIDATE and election.role == ElectionRole.NEXUS:
+            self.metrics.elections_won += 1
             self.event_log.append({
                 "tick": self.tick_count,
                 "type": "election_won",
@@ -181,12 +188,27 @@ class Swarm:
                 "winner": drone_id,
             })
         elif prev_role == ElectionRole.NEXUS and election.role == ElectionRole.FOLLOWER:
+            self.metrics.merges += 1
             self.event_log.append({
                 "tick": self.tick_count,
                 "type": "swarms_merged",
                 "detail": f"{drone_id} yielded nexus to {election.known_nexus_id} (newer term {election.term})",
                 "drones": [drone_id],
             })
+
+    def _track_recovery(self, drone_id: str, previous, election: NexusElection) -> None:
+        """Per-drone time-without-a-known-nexus -- see metrics.py for why
+        this is the metric used instead of a swarm-wide MTTR figure."""
+        if previous is None:
+            return
+        _, prev_nexus = previous
+        curr_nexus = election.known_nexus_id
+        if prev_nexus is not None and curr_nexus is None:
+            self._nexus_gap_start[drone_id] = self.time_s
+        elif prev_nexus is None and curr_nexus is not None:
+            start = self._nexus_gap_start.pop(drone_id, None)
+            if start is not None:
+                self.metrics.record_recovery(self.time_s - start)
 
     def _move(self) -> None:
         for drone in self.drones.values():
@@ -211,6 +233,9 @@ class Swarm:
                 degree = len(adjacency.get(drone.id, ()))
                 drone.role = "relay" if degree >= 2 else "leaf"
 
+    def metrics_snapshot(self) -> dict:
+        return self.metrics.snapshot(self.mesh, self.elections)
+
     def to_state_dict(self) -> dict:
         adjacency = build_adjacency(self.drones, self.comm_range)
         edges = sorted({tuple(sorted((a, b))) for a, neighbors in adjacency.items() for b in neighbors})
@@ -219,4 +244,5 @@ class Swarm:
             "drones": [d.to_dict() for d in self.drones.values()],
             "edges": [list(e) for e in edges],
             "event_log": self.event_log[-30:],
+            "metrics": self.metrics_snapshot(),
         }
