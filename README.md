@@ -26,6 +26,26 @@ Cascading failure, partitions, and merges all fall out of this same mechanism, n
 
 An earlier version of this project used a synchronous global recompute each tick instead — every drone had instant, perfect knowledge of the whole mesh, which made convergence trivial but wasn't an honest simulation of a real network. Rebuilding it on real message-passing surfaced a genuine bug in the process: a stale, late-arriving candidacy for a term that was already decided could wrongly knock an already-elected nexus back into a fresh campaign, forever. `tests/test_election.py` has a regression test for it.
 
+## Byzantine fault tolerance (`SwarmConfig(bft_mode=True)`)
+
+Everything above trusts message content at face value — fine against clean failures (a drone going offline), not against a rogue transmitter actively lying. `bft_mode` hardens the swarm against a specific, honestly-scoped threat model, using real Ed25519 signatures (the `cryptography` library — the same modern signature scheme behind SSH, TLS 1.3, and Signal — not hand-rolled crypto):
+
+- **Impersonation** — a rogue transmitter claims to be a real drone. Defeated: every message is signed by the sender's own key, and verified against that drone's known public key before it's trusted at all. No valid signature, no effect on the swarm.
+- **Priority forgery** — a compromised drone lies about its own priority to win elections it shouldn't. Defeated: every claimed priority must be backed by a `Credential` signed once, at swarm setup, by a `SwarmAuthority` key (standing in for a fleet operator/manufacturer). A drone has its own signing key but not the authority's, so it can forge its own messages freely but can't unilaterally claim a higher priority than it was actually issued.
+- **Term inflation** — a forged heartbeat claims a huge term number to hijack the whole swarm's loyalty in one shot. Defeated: a heartbeat claiming a term more than one step ahead of what a receiver already knows must carry a `quorum_certificate` — real, independently-verified candidacies from a strict majority of the swarm, proving an election actually happened. Small, routine increments (ordinary cascading failover) never need one, so this doesn't change day-to-day behavior — it only closes the term-inflation attack specifically.
+- **Replay / repurposed evidence** — resending an old legitimate message, or bundling a real captured candidacy into a certificate for a different term than it was actually signed for. Defeated: certificates only count entries whose term matches exactly.
+
+**Honest limitation, stated plainly, not glossed over:** the quorum threshold is a majority of the swarm's *original* member count, fixed at setup. That's a deliberate simplification — it means a connected component smaller than a majority of the original swarm can't *cryptographically certify* a big term jump for itself under `bft_mode`, even though the underlying election mechanism would otherwise let it operate independently (see Partition tolerance above). This project defends against a **minority** of malicious/rogue nodes within a partition, not an unbounded majority, and doesn't solve fully dynamic BFT membership — both genuinely open problems in real distributed systems, not shortcuts unique to this toy version.
+
+### The antagonist
+
+`antagonist/` is a separate, deliberately loosely-coupled package that plays the adversary — it only ever talks to a target swarm through the same message-injection channel a real rogue transmitter would use (`mesh.broadcast()`), never by reaching into election internals or reading real private keys out of the swarm to cheat. It runs each attack above against a live `bft_mode` swarm and reports, attack by attack, whether the swarm's real elected nexus was affected. See `antagonist/README.md` for details — it's scoped so it could be extracted into its own general-purpose adversarial mesh-network testing tool later with minimal rework.
+
+```bash
+source .venv/bin/activate
+python3 -m antagonist.cli
+```
+
 ### Movement
 
 Drones aren't pinned in place — each one drifts at a constant velocity and bounces off the arena's edges (`Swarm._move`, run at the start of every tick, before positions sync to the mesh). This is what makes partitions and merges an ongoing, organic part of watching the demo rather than something you can only trigger by clicking — swarms split and reconverge on their own as drones wander in and out of range.
@@ -39,14 +59,16 @@ drone_swarm/
   model.py          # Drone dataclass (pure data — no election bookkeeping)
   topology.py        # adjacency / connected components / BFS — for visualization only
   protocol.py        # message schemas: NexusHeartbeat, ElectionMessage
+  identity.py         # Ed25519 signing keys, credentials, SwarmAuthority — bft_mode only
   mesh_network.py   # range-limited mesh: latency, packet loss, multi-hop relay
   election.py        # NexusElection — per-drone heartbeat/term-based Bully algorithm
   swarm.py            # Swarm: owns drones, the mesh, and every drone's election state
   simulation.py      # random swarm generator
   cli.py               # headless terminal demo, no server needed
+antagonist/          # adversarial testing tool — see the BFT section below
 server.py            # FastAPI + WebSocket server for the live browser demo
 frontend/            # canvas visualization (vanilla HTML/CSS/JS, no build step)
-tests/                 # pytest suite covering topology, election, and swarm behavior
+tests/                 # pytest suite covering topology, election, swarm, and BFT behavior
 ```
 
 ## Running it
@@ -82,7 +104,8 @@ pytest
 
 This project is deliberately scoped to a working, well-tested core first. Natural next steps if extended further:
 - **Obstacle course / objectives**: give the swarm a goal beyond just staying coordinated — navigate from start to end through obstacles and scripted "laser" hazards that pick off whichever drone is currently nexus, forcing a real-time reassessment and re-election mid-navigation.
-- **Byzantine fault tolerance**: handling a drone that's alive but sending bad/malicious election data (a false candidacy, a forged heartbeat), not just drones that go fully offline.
+- **Observability / metrics**: mean time to recovery, election frequency, message overhead under packet loss — turning it from "a demo" into "a system you can measure."
+- **Extract `antagonist/` into its own project**: it's already scoped for this (see above) — a general-purpose adversarial mesh-network testing tool, not drone-specific in its core attack logic.
 - **Physical demo**: porting the coordination logic onto real hardware (e.g., an ESP-NOW mesh across a few ESP32 boards) or a software-in-the-loop simulator like ArduPilot/Gazebo.
 
 ## License

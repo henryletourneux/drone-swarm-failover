@@ -29,14 +29,46 @@ Convergence sketch
   is). That makes merges an emergent property of ordinary heartbeat
   handling — no special-cased merge/runoff logic required, unlike the
   synchronous version this replaced.
+
+Byzantine fault tolerance (`bft_mode`)
+---------------------------------------
+Everything above trusts message content at face value — fine against
+clean failures, not against a rogue transmitter. When `bft_mode` is on:
+
+* Every outgoing message is signed with this drone's own key, and every
+  incoming one is verified against the sender's known public key before
+  it's trusted at all. An unsigned or badly-signed message is dropped,
+  full stop — this defeats impersonation.
+* Every ElectionMessage carries a Credential — this drone's priority,
+  signed once by the SwarmAuthority at setup. A receiver checks the
+  credential matches the claimed priority *and* is validly authority-
+  signed, so a compromised drone can lie about lots of things but can't
+  unilaterally claim a higher priority than it was actually issued.
+* A heartbeat claiming a term more than one step ahead of what a receiver
+  already knows must carry a QuorumCertificate — real, verified
+  candidacies from a majority of the swarm, proving an election actually
+  happened rather than one node just asserting a huge term number. Small,
+  ordinary increments (the common case — routine cascading failover)
+  never need one, so this doesn't change day-to-day behavior at all; it
+  only closes the term-inflation attack specifically.
+
+Honest limitation, stated plainly: the quorum threshold is a majority of
+`total_swarm_size` (the swarm's original member count, fixed at setup).
+That's a deliberate simplification, and it means a connected component
+smaller than a majority of the original swarm can't *cryptographically
+certify* a big term jump for itself, even though the underlying election
+mechanism would otherwise let it operate independently. This project
+prioritizes defending against a minority of malicious/rogue nodes within
+a partition — not an unbounded majority, and not truly dynamic
+membership, both of which are open problems in real BFT systems too.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from .protocol import ElectionMessage, NexusHeartbeat
+from .protocol import ElectionMessage, NexusHeartbeat, election_message_payload, heartbeat_payload
 
 
 class ElectionRole(Enum):
@@ -52,6 +84,10 @@ class _Campaign:
     term: int
     deadline_s: float
     superseded: bool = False
+    # bft_mode only: verified candidacies seen for this exact term, keyed
+    # by sender so a straggler/duplicate doesn't get double-counted —
+    # the raw material for this campaign's quorum certificate if it wins.
+    participants: dict = field(default_factory=dict)
 
 
 class NexusElection:
@@ -68,12 +104,26 @@ class NexusElection:
         nexus_heartbeat_interval_s: float,
         nexus_timeout_s: float,
         election_window_s: float | None = None,
+        bft_mode: bool = False,
+        identity=None,
+        credential=None,
+        registry=None,
+        total_swarm_size: int = 1,
     ) -> None:
         self._heartbeat_interval_s = nexus_heartbeat_interval_s
         self._timeout_s = nexus_timeout_s
         self._election_window_s = (
             election_window_s if election_window_s is not None else nexus_heartbeat_interval_s
         )
+
+        # bft_mode=False (default): none of this is touched, zero overhead,
+        # behavior identical to before BFT existed.
+        self._bft_mode = bft_mode
+        self._identity = identity  # this drone's own DroneIdentity
+        self._credential = credential  # this drone's authority-signed Credential
+        self._registry = registry  # IdentityRegistry, shared read-only across the swarm
+        self._total_swarm_size = total_swarm_size
+        self._quorum_certificate: tuple = ()
 
         self.role: ElectionRole = ElectionRole.FOLLOWER
         self.known_nexus_id: str | None = None
@@ -96,6 +146,49 @@ class NexusElection:
 
         return self.role, outgoing
 
+    # -- BFT verification ---------------------------------------------------
+
+    def _verify_election_message(self, msg: ElectionMessage) -> bool:
+        if not self._bft_mode:
+            return True
+        if msg.signature is None or msg.credential is None:
+            return False
+        payload = election_message_payload(msg.sender_id, msg.sent_at_s, msg.term, msg.priority)
+        if not self._registry.verify_signature(msg.sender_id, payload, msg.signature):
+            return False
+        credential = msg.credential
+        if credential.drone_id != msg.sender_id or credential.priority != msg.priority:
+            return False  # claiming a priority its credential doesn't actually back
+        return self._registry.verify_credential(credential)
+
+    def _verify_heartbeat(self, msg: NexusHeartbeat) -> bool:
+        if not self._bft_mode:
+            return True
+        if msg.signature is None:
+            return False
+        payload = heartbeat_payload(msg.sender_id, msg.sent_at_s, msg.term)
+        if not self._registry.verify_signature(msg.sender_id, payload, msg.signature):
+            return False
+
+        # Small, routine term increments (ordinary cascading failover)
+        # never need a quorum certificate. Only a suspiciously large jump
+        # does -- that's the actual term-inflation attack shape.
+        if msg.term <= self.term + 1:
+            return True
+        return self._verify_quorum_certificate(msg)
+
+    def _verify_quorum_certificate(self, msg: NexusHeartbeat) -> bool:
+        distinct_signers = {msg.sender_id}
+        for candidacy in msg.quorum_certificate:
+            if not isinstance(candidacy, ElectionMessage):
+                continue
+            if candidacy.term != msg.term or candidacy.sender_id == msg.sender_id:
+                continue
+            if not self._verify_election_message(candidacy):
+                continue  # doesn't count toward quorum -- couldn't be verified
+            distinct_signers.add(candidacy.sender_id)
+        return len(distinct_signers) > self._total_swarm_size / 2
+
     # -- message ingestion ------------------------------------------------
 
     def _ingest_heartbeats(self, now_s: float, self_id: str, incoming: list) -> None:
@@ -108,6 +201,8 @@ class NexusElection:
         for msg in incoming:
             if not isinstance(msg, NexusHeartbeat) or msg.sender_id == self_id:
                 continue
+            if not self._verify_heartbeat(msg):
+                continue  # unsigned, forged, or an unproven term jump -- dropped
             newer_term = msg.term > self.term
             same_term_ok = msg.term == self.term and (
                 self.known_nexus_id is None or msg.sender_id >= self.known_nexus_id
@@ -126,6 +221,8 @@ class NexusElection:
         for msg in incoming:
             if not isinstance(msg, ElectionMessage) or msg.sender_id == self_id:
                 continue
+            if not self._verify_election_message(msg):
+                continue  # unsigned, forged, or an uncertified priority claim -- dropped
             if msg.term < self.term:
                 continue  # stale election for an already-decided term
 
@@ -145,6 +242,9 @@ class NexusElection:
                 continue
 
             self._join_election(now_s, msg.term, self_id, self_priority, outgoing)
+
+            if self._bft_mode and self._campaign is not None and self._campaign.term == msg.term:
+                self._campaign.participants[msg.sender_id] = msg
 
             if (msg.priority, msg.sender_id) > (self_priority, self_id):
                 if self._campaign is not None:
@@ -169,7 +269,7 @@ class NexusElection:
         self.role = ElectionRole.CANDIDATE
         self.known_nexus_id = None
         self._campaign = _Campaign(term=term, deadline_s=now_s + self._election_window_s)
-        outgoing.append(ElectionMessage(sender_id=self_id, sent_at_s=now_s, term=term, priority=self_priority))
+        outgoing.append(self._make_election_message(self_id, now_s, term, self_priority))
 
     def _maybe_resolve_campaign(self, now_s: float, self_id: str, outgoing: list) -> None:
         campaign = self._campaign
@@ -181,6 +281,7 @@ class NexusElection:
             self.known_nexus_id = self_id
             self.term = campaign.term
             self._last_nexus_contact_s = now_s
+            self._quorum_certificate = tuple(campaign.participants.values())
             self._emit_heartbeat(now_s, self_id, outgoing)
         else:
             # Lost. Step back and grant the winner a fresh timeout window
@@ -198,7 +299,7 @@ class NexusElection:
         already_sent = any(isinstance(m, ElectionMessage) and m.sender_id == self_id for m in outgoing)
         if already_sent:
             return
-        outgoing.append(ElectionMessage(sender_id=self_id, sent_at_s=now_s, term=campaign.term, priority=self_priority))
+        outgoing.append(self._make_election_message(self_id, now_s, campaign.term, self_priority))
 
     # -- nexus duties -------------------------------------------------------
 
@@ -210,6 +311,30 @@ class NexusElection:
             self._emit_heartbeat(now_s, self_id, outgoing)
 
     def _emit_heartbeat(self, now_s: float, self_id: str, outgoing: list) -> None:
-        outgoing.append(NexusHeartbeat(sender_id=self_id, sent_at_s=now_s, term=self.term))
+        signature = None
+        if self._bft_mode:
+            signature = self._identity.sign(heartbeat_payload(self_id, now_s, self.term))
+        outgoing.append(NexusHeartbeat(
+            sender_id=self_id,
+            sent_at_s=now_s,
+            term=self.term,
+            signature=signature,
+            quorum_certificate=self._quorum_certificate,
+        ))
         self._last_heartbeat_emitted_s = now_s
         self._last_nexus_contact_s = now_s
+
+    # -- message construction -------------------------------------------------
+
+    def _make_election_message(self, self_id: str, now_s: float, term: int, self_priority: float) -> ElectionMessage:
+        signature = None
+        if self._bft_mode:
+            signature = self._identity.sign(election_message_payload(self_id, now_s, term, self_priority))
+        return ElectionMessage(
+            sender_id=self_id,
+            sent_at_s=now_s,
+            term=term,
+            priority=self_priority,
+            signature=signature,
+            credential=self._credential,
+        )

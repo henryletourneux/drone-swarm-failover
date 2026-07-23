@@ -4,6 +4,7 @@ import random
 from dataclasses import dataclass
 
 from .election import ElectionRole, NexusElection
+from .identity import DroneIdentity, IdentityRegistry, SwarmAuthority
 from .mesh_network import MeshNetwork
 from .topology import build_adjacency
 
@@ -18,6 +19,12 @@ class SwarmConfig:
     represents — it's independent of real wall-clock time, so how "fast"
     a failover feels in a live demo depends on how often the caller
     actually calls tick() (see TICK_SECONDS in server.py).
+
+    `bft_mode` turns on cryptographic signing/verification of every
+    election message (see election.py's module docstring) — off by
+    default so the base coordination mechanism stays exactly as tested
+    without it. Turn it on to run the swarm hardened against the
+    antagonist/ package's attacks.
     """
 
     max_relay_hops: int = 4
@@ -26,6 +33,7 @@ class SwarmConfig:
     nexus_heartbeat_interval_s: float = 1.5
     nexus_timeout_s: float = 4.0
     tick_dt_s: float = 0.4
+    bft_mode: bool = False
 
 
 class Swarm:
@@ -66,10 +74,32 @@ class Swarm:
             latency_s=self.config.comm_latency_s,
             rng=random.Random(seed),
         )
+
+        # Identities are only real cryptographic objects in bft_mode; left
+        # as empty dicts otherwise so callers can always check `swarm.identities`
+        # / `swarm.registry` without a None check, whether or not it's populated.
+        self.authority = None
+        self.registry = None
+        self.identities: dict = {}
+        self.credentials: dict = {}
+        if self.config.bft_mode:
+            self.authority = SwarmAuthority()
+            self.registry = IdentityRegistry(self.authority.public_key)
+            for d in drones:
+                identity = DroneIdentity(d.id)
+                self.identities[d.id] = identity
+                self.credentials[d.id] = self.authority.issue_credential(d.id, d.priority)
+                self.registry.register(d.id, identity.public_key)
+
         self.elections = {
             d.id: NexusElection(
                 nexus_heartbeat_interval_s=self.config.nexus_heartbeat_interval_s,
                 nexus_timeout_s=self.config.nexus_timeout_s,
+                bft_mode=self.config.bft_mode,
+                identity=self.identities.get(d.id),
+                credential=self.credentials.get(d.id),
+                registry=self.registry,
+                total_swarm_size=len(drones),
             )
             for d in drones
         }
