@@ -27,8 +27,14 @@ TICK_SECONDS = 0.4  # matches SwarmConfig.tick_dt_s default, so 1 real second ~=
 
 # bft_mode is on for the live demo specifically so the antagonist has real
 # defenses to demonstrate -- with it off, "Launch Attack" would have nothing
-# to visibly block.
-LIVE_CONFIG = SwarmConfig(bft_mode=True)
+# to visibly block. max_relay_hops is lowered from the default of 4: in a
+# 14-drone swarm this size, almost everyone is already directly reachable,
+# so the extra hops were mostly redundant re-verification of the same
+# messages -- measured at ~113x more per-tick cost than plain mode (up to
+# ~230ms/tick, enough to peg a full CPU core against the 400ms tick budget).
+# hops=2 keeps real multi-hop relay behavior exercised while cutting that to
+# a small fraction of the tick budget even during heavy election activity.
+LIVE_CONFIG = SwarmConfig(bft_mode=True, max_relay_hops=2)
 
 swarm = create_random_swarm(speed=6.0, config=LIVE_CONFIG, seed=None)
 adversary = Antagonist(swarm)  # installs a bounded passive wiretap on swarm.mesh
