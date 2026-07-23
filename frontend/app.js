@@ -25,6 +25,29 @@ let socket = null;
 let hoverId = null;
 let reconnectTimer = null;
 
+// --- Position interpolation --------------------------------------------------
+//
+// The server only broadcasts a new position ~2.5 times/sec (TICK_SECONDS in
+// server.py). Drawing raw positions straight from each message makes motion
+// look like a slideshow rather than smooth flight, no matter how fast the
+// canvas itself can render. So drawing reads from a *continuously* advancing
+// interpolation between the last two known positions instead of the raw
+// server snapshot directly — the standard fix for smooth motion over a
+// low-frequency network feed.
+const UPDATE_INTERVAL_MS = 400; // should match server.py's TICK_SECONDS
+let prevPositions = new Map(); // id -> {x, y}, interpolating FROM
+let nextPositions = new Map(); // id -> {x, y}, interpolating TO
+let updateStartTime = performance.now();
+
+function interpolatedDrones() {
+  const t = Math.min(1, (performance.now() - updateStartTime) / UPDATE_INTERVAL_MS);
+  return state.drones.map((d) => {
+    const from = prevPositions.get(d.id) || { x: d.x, y: d.y };
+    const to = nextPositions.get(d.id) || { x: d.x, y: d.y };
+    return { ...d, x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t };
+  });
+}
+
 // --- Layout / scaling -------------------------------------------------------
 
 let scale = 1;
@@ -57,8 +80,9 @@ function draw() {
   const rect = canvas.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
 
+  const drones = interpolatedDrones();
   const byId = {};
-  for (const d of state.drones) byId[d.id] = d;
+  for (const d of drones) byId[d.id] = d;
 
   // Edges
   ctx.lineWidth = 1.2;
@@ -77,7 +101,7 @@ function draw() {
   }
 
   // Drones
-  for (const d of state.drones) {
+  for (const d of drones) {
     drawDrone(d);
   }
 }
@@ -172,9 +196,12 @@ function droneAt(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
   const mx = clientX - rect.left;
   const my = clientY - rect.top;
+  // Use the same interpolated positions draw() just rendered, so hit
+  // testing always matches what's actually on screen right now.
+  const drones = interpolatedDrones();
   // Iterate in reverse so top-drawn drones win.
-  for (let i = state.drones.length - 1; i >= 0; i--) {
-    const d = state.drones[i];
+  for (let i = drones.length - 1; i >= 0; i--) {
+    const d = drones[i];
     if (!d.alive) continue;
     const p = worldToScreen(d.x, d.y);
     // +10 padding (rather than the visual fill radius alone) so the
@@ -301,10 +328,17 @@ function connect() {
       seenEventKeys.clear();
       logEl.innerHTML = "";
     }
+
+    // Wherever the interpolation currently is (not necessarily fully
+    // caught up yet) becomes the new starting point, so a message that
+    // arrives a little early or late never causes a visible jump.
+    prevPositions = new Map(interpolatedDrones().map((d) => [d.id, { x: d.x, y: d.y }]));
+    nextPositions = new Map(state.drones.map((d) => [d.id, { x: d.x, y: d.y }]));
+    updateStartTime = performance.now();
+
     tickValue.textContent = state.tick;
     aliveValue.textContent = state.drones.filter((d) => d.alive).length;
     renderLog();
-    draw();
   });
 
   socket.addEventListener("close", () => {
@@ -326,9 +360,31 @@ function send(obj) {
 
 // --- Boot -------------------------------------------------------------------
 
-// No continuously-running render loop at all: the canvas only redraws in
-// response to an actual event (a new WebSocket message, a resize, or a
-// hover change), so there's zero JS work happening between real updates.
-window.addEventListener("resize", resizeCanvas);
+// A continuously-running requestAnimationFrame loop, so drone motion reads
+// as smooth flight instead of a ~2.5fps slideshow (see the interpolation
+// section up top). This is safe to run every frame now — the earlier
+// perf work already stripped out the actually-expensive parts (shadowBlur
+// on every drone, backdrop-filter), and the isolated Canvas test proved
+// this machine renders far more circles than this at a real 60fps with
+// no dependency on our app code at all.
+function renderLoop() {
+  draw();
+  requestAnimationFrame(renderLoop);
+}
+requestAnimationFrame(renderLoop);
+
+// Deliberately NOT using window.addEventListener("resize", ...) here: the
+// canvas's actual on-screen size is set by CSS (100% of its container),
+// which can change for reasons that never fire a window resize event at
+// all — a scrollbar toggling, any layout shift elsewhere on the page. When
+// that happens, the canvas's drawing buffer silently goes stale relative
+// to its real displayed size, and draw positions stop agreeing with click
+// positions (worse the further a drone is from wherever the drift happens
+// to be zero — which is exactly the "clicking is a bit off, and gets worse
+// over time" symptom this was causing). ResizeObserver watches the actual
+// element and fires on any real size change, for any reason, closing that
+// gap entirely instead of only reacting to one specific cause of it.
+const resizeObserver = new ResizeObserver(() => resizeCanvas());
+resizeObserver.observe(canvas.parentElement);
 resizeCanvas();
 connect();

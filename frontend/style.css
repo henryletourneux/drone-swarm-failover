@@ -150,11 +150,10 @@ canvas#swarm-canvas {
   font-size: 0.72rem;
   letter-spacing: 0.12em;
   color: var(--text-dim);
-  background: rgba(10, 14, 20, 0.7);
+  background: rgba(10, 14, 20, 0.85);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 6px 10px;
-  backdrop-filter: blur(4px);
 }
 .hud-num { color: var(--accent); font-weight: 600; }
 
@@ -171,7 +170,7 @@ canvas#swarm-canvas {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 7px 11px;
-  backdrop-filter: blur(4px);
+  background: rgba(10, 14, 20, 0.85);
 }
 .legend-item { display: inline-flex; align-items: center; gap: 6px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
