@@ -41,10 +41,15 @@ let socket = null;
 let hoverId = null;
 let reconnectTimer = null;
 
-// A brief red flash drawn over whichever drone the last antagonist attack
-// targeted, so a thrown-and-blocked attack is visible on the canvas itself,
-// not just in the event log / security stat. Purely cosmetic client state.
-const ATTACK_FLASH_MS = 1100;
+// An antagonist attack plays out on the canvas itself in two stages: a
+// glowing projectile flies in from off-screen toward the target drone
+// (the forged packet arriving), then a bigger impact flash + a brief
+// full-canvas red vignette mark the moment it's evaluated (and rejected).
+// Purely cosmetic client state — the actual outcome is already decided
+// server-side by the time any of this plays.
+const ATTACK_PROJECTILE_MS = 550;
+const ATTACK_FLASH_MS = 1300;
+let activeAttackProjectile = null; // {droneId, startTime, angle}
 let activeAttackFlash = null; // {droneId, startTime}
 
 // --- Position interpolation --------------------------------------------------
@@ -127,41 +132,108 @@ function draw() {
     drawDrone(d);
   }
 
-  // Antagonist attack flash, drawn on top so it's always visible.
+  // Antagonist attack: an incoming projectile (the forged packet arriving),
+  // then a bigger impact + vignette pulse the instant it lands, so the
+  // whole thing plays out visibly in the arena, not just as a log entry.
+  if (activeAttackProjectile) {
+    const elapsed = performance.now() - activeAttackProjectile.startTime;
+    if (elapsed > ATTACK_PROJECTILE_MS) {
+      activeAttackFlash = { droneId: activeAttackProjectile.droneId, startTime: performance.now() };
+      activeAttackProjectile = null;
+    } else {
+      const target = byId[activeAttackProjectile.droneId];
+      if (target) {
+        drawAttackProjectile(rect, target, elapsed / ATTACK_PROJECTILE_MS, activeAttackProjectile.angle);
+      } else {
+        activeAttackProjectile = null;
+      }
+    }
+  }
+
   if (activeAttackFlash) {
     const elapsed = performance.now() - activeAttackFlash.startTime;
     if (elapsed > ATTACK_FLASH_MS) {
       activeAttackFlash = null;
     } else {
+      const t = elapsed / ATTACK_FLASH_MS;
       const target = byId[activeAttackFlash.droneId];
-      if (target) drawAttackFlash(target, elapsed / ATTACK_FLASH_MS);
+      if (elapsed < 220) drawAttackVignette(rect, 1 - elapsed / 220);
+      if (target) drawAttackFlash(target, t);
     }
   }
+}
+
+function drawAttackVignette(rect, alpha) {
+  // A brief red glow around the edges of the whole canvas at the moment
+  // of impact -- visible even if you weren't looking straight at the
+  // target drone when the projectile landed.
+  const grad = ctx.createRadialGradient(
+    rect.width / 2, rect.height / 2, Math.min(rect.width, rect.height) * 0.25,
+    rect.width / 2, rect.height / 2, Math.max(rect.width, rect.height) * 0.7
+  );
+  grad.addColorStop(0, "rgba(255, 59, 59, 0)");
+  grad.addColorStop(1, `rgba(255, 59, 59, ${alpha * 0.35})`);
+  ctx.save();
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, rect.width, rect.height);
+  ctx.restore();
+}
+
+function drawAttackProjectile(rect, d, t, angle) {
+  const targetP = worldToScreen(d.x, d.y);
+  const launchDist = Math.max(rect.width, rect.height) * 0.9;
+  const fromX = targetP.x + Math.cos(angle) * launchDist;
+  const fromY = targetP.y + Math.sin(angle) * launchDist;
+  // Ease in, so it starts fast (far away) and visibly decelerates into the hit.
+  const eased = 1 - (1 - t) * (1 - t);
+  const curX = fromX + (targetP.x - fromX) * eased;
+  const curY = fromY + (targetP.y - fromY) * eased;
+  const trailX = fromX + (targetP.x - fromX) * Math.max(0, eased - 0.12);
+  const trailY = fromY + (targetP.y - fromY) * Math.max(0, eased - 0.12);
+
+  ctx.save();
+  const trail = ctx.createLinearGradient(trailX, trailY, curX, curY);
+  trail.addColorStop(0, "rgba(255, 59, 59, 0)");
+  trail.addColorStop(1, "rgba(255, 90, 80, 0.9)");
+  ctx.strokeStyle = trail;
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(trailX, trailY);
+  ctx.lineTo(curX, curY);
+  ctx.stroke();
+
+  ctx.shadowColor = "#ff3b3b";
+  ctx.shadowBlur = 14;
+  ctx.fillStyle = "#ff5a50";
+  ctx.beginPath();
+  ctx.arc(curX, curY, 4.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
 }
 
 function drawAttackFlash(d, t) {
   const p = worldToScreen(d.x, d.y);
   const alpha = 1 - t;
-  const radius = 14 + t * 40;
+  const radius = 18 + t * 55;
 
   ctx.save();
-  ctx.strokeStyle = `rgba(255, 59, 59, ${alpha * 0.85})`;
-  ctx.lineWidth = 3;
+  ctx.strokeStyle = `rgba(255, 59, 59, ${alpha * 0.9})`;
+  ctx.lineWidth = 3.5;
   ctx.beginPath();
   ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
   ctx.stroke();
 
-  ctx.strokeStyle = `rgba(255, 140, 130, ${alpha * 0.6})`;
+  ctx.strokeStyle = `rgba(255, 140, 130, ${alpha * 0.65})`;
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.arc(p.x, p.y, radius * 0.6, 0, Math.PI * 2);
   ctx.stroke();
 
   ctx.globalAlpha = alpha;
-  ctx.font = "16px system-ui, -apple-system, sans-serif";
+  ctx.font = "18px system-ui, -apple-system, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
-  ctx.fillText("☠", p.x, p.y - 22 - t * 10);
+  ctx.fillText("☠", p.x, p.y - 24 - t * 12);
   ctx.restore();
 }
 
@@ -332,7 +404,7 @@ function renderLog() {
     seenEventKeys.add(key);
 
     if (ev.type === "attack" && ev.drone) {
-      activeAttackFlash = { droneId: ev.drone, startTime: performance.now() };
+      activeAttackProjectile = { droneId: ev.drone, startTime: performance.now(), angle: Math.random() * Math.PI * 2 };
     }
 
     if (emptyPlaceholder) emptyPlaceholder.remove();
