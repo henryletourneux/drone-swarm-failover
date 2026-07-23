@@ -7,23 +7,25 @@ easy to read end to end.
 """
 from __future__ import annotations
 
-import math
+from .spatial_grid import SpatialGrid
 
 
 def build_adjacency(drones: dict, comm_range: float) -> dict:
-    """Return {drone_id: set(neighbor_ids)} for alive drones within comm_range."""
-    alive_ids = [d.id for d in drones.values() if d.alive]
-    adjacency = {drone_id: set() for drone_id in alive_ids}
+    """Return {drone_id: set(neighbor_ids)} for alive drones within comm_range.
 
-    for i, a_id in enumerate(alive_ids):
-        a = drones[a_id]
-        for b_id in alive_ids[i + 1:]:
-            b = drones[b_id]
-            dist = math.hypot(a.x - b.x, a.y - b.y)
-            if dist <= comm_range:
-                adjacency[a_id].add(b_id)
-                adjacency[b_id].add(a_id)
+    Uses a SpatialGrid rather than an all-pairs distance check -- the
+    naive version is O(n^2) per call, which is fine at a handful of
+    drones but measured catastrophically bad at 100 (this is called
+    twice per tick, on top of MeshNetwork's own per-message neighbor
+    queries -- see spatial_grid.py for the full profiling story).
+    """
+    alive = {d.id: (d.x, d.y) for d in drones.values() if d.alive}
+    grid = SpatialGrid(cell_size=max(comm_range, 1.0))
+    grid.rebuild(alive)
 
+    adjacency = {drone_id: set() for drone_id in alive}
+    for drone_id in alive:
+        adjacency[drone_id] = set(grid.neighbors_within(drone_id, comm_range))
     return adjacency
 
 

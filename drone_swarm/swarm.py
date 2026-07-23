@@ -109,6 +109,13 @@ class Swarm:
         for d in drones:
             self.mesh.update_known_position(d.id, d.x, d.y, d.alive)
 
+        # Cached by tick() and reused by to_state_dict() -- both used to
+        # independently call build_adjacency, computing the same thing
+        # twice every tick for no reason. Computed once here too so a
+        # to_state_dict() call before the first tick() (e.g. serving the
+        # very first WebSocket message) still returns real edges.
+        self._last_adjacency: dict = build_adjacency(self.drones, self.comm_range)
+
     def kill(self, drone_id: str) -> bool:
         drone = self.drones.get(drone_id)
         if drone is None or not drone.alive:
@@ -160,8 +167,8 @@ class Swarm:
             self._log_transition(drone_id, previous, election)
             self._track_recovery(drone_id, previous, election)
 
-        adjacency = build_adjacency(self.drones, self.comm_range)
-        self._assign_roles(adjacency)
+        self._last_adjacency = build_adjacency(self.drones, self.comm_range)
+        self._assign_roles(self._last_adjacency)
 
         if len(self.event_log) > MAX_EVENT_LOG:
             self.event_log = self.event_log[-MAX_EVENT_LOG:]
@@ -237,10 +244,10 @@ class Swarm:
         return self.metrics.snapshot(self.mesh, self.elections)
 
     def to_state_dict(self) -> dict:
-        adjacency = build_adjacency(self.drones, self.comm_range)
-        edges = sorted({tuple(sorted((a, b))) for a, neighbors in adjacency.items() for b in neighbors})
+        edges = sorted({tuple(sorted((a, b))) for a, neighbors in self._last_adjacency.items() for b in neighbors})
         return {
             "tick": self.tick_count,
+            "world": {"width": self.width, "height": self.height},
             "drones": [d.to_dict() for d in self.drones.values()],
             "edges": [list(e) for e in edges],
             "event_log": self.event_log[-30:],
