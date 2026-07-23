@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Drone Swarm Failover</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="title-block">
+        <h1>Drone Swarm Failover</h1>
+        <p class="subtitle">Kill the nexus. Watch the swarm heal itself.</p>
+      </div>
+      <div class="controls">
+        <span id="conn-indicator" class="conn conn--connecting" title="Connection status">
+          <span class="conn-dot"></span><span id="conn-label">connecting</span>
+        </span>
+        <button id="reset-btn" type="button">Reset Swarm</button>
+      </div>
+    </header>
+
+    <main class="stage">
+      <section class="canvas-wrap">
+        <canvas id="swarm-canvas"></canvas>
+        <div class="hud">
+          <span class="hud-item">TICK <span id="tick-value" class="hud-num">0</span></span>
+          <span class="hud-item">ALIVE <span id="alive-value" class="hud-num">0</span></span>
+        </div>
+        <div class="legend">
+          <span class="legend-item"><i class="dot dot--nexus"></i>nexus</span>
+          <span class="legend-item"><i class="dot dot--relay"></i>relay</span>
+          <span class="legend-item"><i class="dot dot--leaf"></i>leaf</span>
+          <span class="legend-item"><i class="dot dot--dead"></i>down</span>
+        </div>
+      </section>
+
+      <aside class="log-panel">
+        <h2>Event Log</h2>
+        <ul id="event-log"></ul>
+      </aside>
+    </main>
+
+    <footer class="hint">Click any live drone to shoot it down.</footer>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
