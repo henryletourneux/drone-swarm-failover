@@ -9,6 +9,20 @@ drones -- alive, not currently occupying a zone, not already investigating
 something else -- the exact same reserve-pool notion `HeuristicAllocator.
 plan_substitutions()` already uses for battery-substitution relief.
 
+Each disturbance has a random `severity` (1-3), and resolving it takes
+`severity` drones' worth of *combined* presence, not just any one drone
+showing up: `_advance` accrues `min(currently-present-investigators,
+severity)` effort per tick against a `severity * investigation_ticks_
+required` total, so under-resourcing it (fewer investigators than
+severity calls for) genuinely slows resolution down rather than being
+free, and over-resourcing it past severity doesn't speed things up
+further -- this is the "properly allocating resources" half of the
+response, not just "someone eventually looks into it." `_dispatch`
+mirrors `HeuristicAllocator.allocate()`'s own shape almost exactly:
+keep assigning the nearest still-idle drone to whichever disturbance
+needs it most (most severe, then longest-waiting) until every
+disturbance's headcount is met or idle drones run out.
+
 An earlier version of this dispatched from a zone's "surplus" occupants
 (beyond `required_drones`) instead. That was a real design bug, not just
 a naming choice: `HeuristicAllocator.allocate()` never assigns more than a
@@ -68,9 +82,12 @@ same reasoning as `FlockingConfig` not being frozen (see flocking.py).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .mission import MIN_BATTERY_TO_ASSIGN
+
+MIN_SEVERITY = 1
+MAX_SEVERITY = 3
 
 
 @dataclass
@@ -79,7 +96,8 @@ class Disturbance:
     x: float
     y: float
     spawned_tick: int
-    investigator_id: str | None = None
+    severity: int = 1
+    investigator_ids: list = field(default_factory=list)
     ticks_investigated: int = 0
     resolved: bool = False
     resolved_at_tick: int | None = None
@@ -184,7 +202,8 @@ class PatrolState:
         x = self._rng.uniform(m, max(m, swarm.width - m))
         y = self._rng.uniform(m, max(m, swarm.height - m))
         disturbance_id = self._new_id()
-        self.disturbances[disturbance_id] = Disturbance(id=disturbance_id, x=x, y=y, spawned_tick=tick)
+        severity = self._rng.randint(MIN_SEVERITY, MAX_SEVERITY)
+        self.disturbances[disturbance_id] = Disturbance(id=disturbance_id, x=x, y=y, spawned_tick=tick, severity=severity)
         return disturbance_id
 
     def add_disturbance(self, x: float, y: float, tick: int) -> str:
@@ -194,25 +213,32 @@ class PatrolState:
         randomly-timed spawns from cluttering the arena over time, not to
         limit an explicit, one-at-a-time user action, the same way
         `_launch_random_attack` in server.py always fires regardless of
-        ambient swarm state."""
+        ambient swarm state. Severity is still randomized rather than
+        fixed, same as an auto-spawned one -- the operator is flagging
+        *where* to look, not diagnosing how serious it'll turn out to be."""
         disturbance_id = self._new_id()
-        self.disturbances[disturbance_id] = Disturbance(id=disturbance_id, x=x, y=y, spawned_tick=tick)
+        severity = self._rng.randint(MIN_SEVERITY, MAX_SEVERITY)
+        self.disturbances[disturbance_id] = Disturbance(id=disturbance_id, x=x, y=y, spawned_tick=tick, severity=severity)
         return disturbance_id
 
     def _dispatch(self, swarm) -> list:
-        """Sends the nearest idle drone after each unassigned disturbance,
-        oldest disturbance first. "Idle" is exactly mission.py's own
-        reserve-pool definition (see module docstring for why this isn't
-        zone-surplus): alive, not currently occupying any zone, not
-        already investigating something else."""
+        """Keeps assigning the nearest still-idle drone to whichever
+        under-resourced disturbance needs it most (most severe first, then
+        longest-waiting) until every disturbance's investigator headcount
+        matches its severity or idle drones run out -- the same
+        keep-assigning-until-met-or-out-of-candidates shape as
+        `HeuristicAllocator.allocate()`, just for investigator headcount
+        instead of zone headcount. "Idle" is exactly mission.py's own
+        reserve-pool definition: alive, not currently occupying any zone,
+        not already investigating something else."""
         mission = swarm.mission
         if mission is None:
             return []
-        unassigned = sorted(
-            (d for d in self.disturbances.values() if not d.resolved and d.investigator_id is None),
-            key=lambda d: d.spawned_tick,
+        needing = sorted(
+            (d for d in self.disturbances.values() if not d.resolved and len(d.investigator_ids) < d.severity),
+            key=lambda d: (-d.severity, d.spawned_tick),
         )
-        if not unassigned:
+        if not needing:
             return []
 
         committed = {
@@ -228,41 +254,58 @@ class PatrolState:
         ]
 
         events = []
-        for disturbance in unassigned:
-            if not idle:
-                break
-            nearest = min(idle, key=lambda d: math.hypot(d.x - disturbance.x, d.y - disturbance.y))
-            idle.remove(nearest)
-            nearest.investigating_disturbance_id = disturbance.id
-            disturbance.investigator_id = nearest.id
-            events.append({"disturbance_id": disturbance.id, "drone_id": nearest.id, "kind": "dispatched"})
+        for disturbance in needing:
+            still_needed = disturbance.severity - len(disturbance.investigator_ids)
+            for _ in range(still_needed):
+                if not idle:
+                    return events
+                nearest = min(idle, key=lambda d: math.hypot(d.x - disturbance.x, d.y - disturbance.y))
+                idle.remove(nearest)
+                nearest.investigating_disturbance_id = disturbance.id
+                disturbance.investigator_ids.append(nearest.id)
+                events.append({"disturbance_id": disturbance.id, "drone_id": nearest.id, "kind": "dispatched"})
         return events
 
     def _advance(self, swarm, tick: int) -> list:
         events = []
         for disturbance in self.disturbances.values():
-            if disturbance.resolved or disturbance.investigator_id is None:
+            if disturbance.resolved:
                 continue
-            drone = swarm.drones.get(disturbance.investigator_id)
-            if drone is None or not drone.alive:
-                # Investigator died mid-investigation: the disturbance goes
-                # back on the market for the next spare drone, same as any
-                # other abandoned assignment in this codebase (mirrors
-                # MissionState.tick()'s own dead-drone handling).
-                if drone is not None:
-                    drone.investigating_disturbance_id = None
-                disturbance.investigator_id = None
-                disturbance.ticks_investigated = 0
-                continue
-            distance = math.hypot(drone.x - disturbance.x, drone.y - disturbance.y)
-            if distance > self.config.investigation_range:
-                continue  # still travelling in
-            disturbance.ticks_investigated += 1
-            if disturbance.ticks_investigated >= self.config.investigation_ticks_required:
+
+            present = 0
+            for investigator_id in list(disturbance.investigator_ids):
+                drone = swarm.drones.get(investigator_id)
+                if drone is None or not drone.alive:
+                    # Investigator died mid-investigation: it's dropped
+                    # from the roster (progress made so far is NOT reset --
+                    # only the accrual rate suffers until _dispatch backfills
+                    # the vacancy), same "abandoned assignment, existing
+                    # machinery re-absorbs/replaces it" idiom used elsewhere
+                    # in this codebase.
+                    if drone is not None:
+                        drone.investigating_disturbance_id = None
+                    disturbance.investigator_ids.remove(investigator_id)
+                    continue
+                if math.hypot(drone.x - disturbance.x, drone.y - disturbance.y) <= self.config.investigation_range:
+                    present += 1  # arrived and actively contributing this tick
+
+            if not disturbance.investigator_ids:
+                continue  # nobody assigned (yet, or anymore) -- nothing to accrue
+
+            # Capped at severity: sending more than the situation calls for
+            # doesn't resolve it any faster, only sending FEWER does real
+            # harm (partial credit, proportionally slower).
+            disturbance.ticks_investigated += min(present, disturbance.severity)
+            required_effort = disturbance.severity * self.config.investigation_ticks_required
+            if disturbance.ticks_investigated >= required_effort:
                 disturbance.resolved = True
                 disturbance.resolved_at_tick = tick
-                drone.investigating_disturbance_id = None
-                events.append({"disturbance_id": disturbance.id, "drone_id": drone.id, "kind": "resolved"})
+                resolved_by = list(disturbance.investigator_ids)
+                for investigator_id in resolved_by:
+                    drone = swarm.drones.get(investigator_id)
+                    if drone is not None:
+                        drone.investigating_disturbance_id = None
+                events.append({"disturbance_id": disturbance.id, "drone_ids": resolved_by, "kind": "resolved"})
         return events
 
     def _prune_resolved(self, tick: int) -> None:
@@ -299,8 +342,9 @@ class PatrolState:
                     "id": d.id,
                     "x": d.x,
                     "y": d.y,
-                    "investigator_id": d.investigator_id,
-                    "progress": min(1.0, d.ticks_investigated / self.config.investigation_ticks_required),
+                    "severity": d.severity,
+                    "investigator_ids": list(d.investigator_ids),
+                    "progress": min(1.0, d.ticks_investigated / (d.severity * self.config.investigation_ticks_required)),
                     "resolved": d.resolved,
                 }
                 for d in self.disturbances.values()

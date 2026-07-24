@@ -242,22 +242,28 @@ function drawPatrolRoute(patrol) {
 }
 
 // Disturbance sites (drone_swarm/patrol.py): a pulsing marker with a
-// progress ring that fills as the dispatched investigator accrues
-// investigation time, plus a dashed line out to whichever drone is
-// currently on the case -- drawn every frame for as long as the
-// investigation is ongoing (unlike the one-shot relief beacon above,
-// since a disturbance investigation is a long-running state, not a
-// single dispatch event to flash and forget).
+// progress ring that fills as accumulated investigator-effort accrues
+// (drone_swarm/patrol.py's severity-scaled response -- resolving a
+// severity-3 disturbance takes 3x the combined effort of a severity-1
+// one), plus a dashed line out to every drone currently on the case --
+// there can be several at once now, not just one. A row of small dots
+// beneath the marker shows resourcing at a glance: filled = currently
+// assigned, hollow = still needed to match severity. Drawn every frame
+// for as long as the investigation is ongoing (unlike the one-shot
+// relief beacon above, since this is a long-running state, not a single
+// dispatch event to flash and forget).
 function drawDisturbances(disturbances, byId) {
   const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 260);
   for (const dist of disturbances) {
     const p = worldToScreen(dist.x, dist.y);
     const color = dist.resolved ? "110, 231, 183" : "255, 159, 67"; // green once resolved, amber while active
-    const baseR = 9;
+    const severity = dist.severity || 1;
+    const baseR = 7 + severity * 2; // bigger marker for a more severe disturbance
 
-    if (dist.investigator_id && !dist.resolved) {
-      const inv = byId[dist.investigator_id];
-      if (inv) {
+    if (!dist.resolved) {
+      for (const investigatorId of dist.investigator_ids || []) {
+        const inv = byId[investigatorId];
+        if (!inv) continue;
         const ip = worldToScreen(inv.x, inv.y);
         ctx.save();
         ctx.setLineDash([4, 4]);
@@ -290,6 +296,18 @@ function drawDisturbances(disturbances, byId) {
     ctx.textBaseline = "middle";
     ctx.fillStyle = `rgba(${color}, 0.95)`;
     ctx.fillText(dist.resolved ? "✓" : "!", p.x, p.y);
+
+    if (!dist.resolved) {
+      const assigned = (dist.investigator_ids || []).length;
+      const dotSpacing = 7;
+      const startX = p.x - ((severity - 1) * dotSpacing) / 2;
+      for (let i = 0; i < severity; i++) {
+        ctx.beginPath();
+        ctx.arc(startX + i * dotSpacing, p.y + baseR + 9, 2, 0, Math.PI * 2);
+        ctx.fillStyle = i < assigned ? `rgba(${color}, 0.9)` : "rgba(255, 255, 255, 0.2)";
+        ctx.fill();
+      }
+    }
   }
 }
 

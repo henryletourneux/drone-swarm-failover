@@ -33,10 +33,17 @@ def _tick(swarm, n):
 class _FixedRng:
     """Deterministic stand-in for random.Random -- always returns the
     midpoint of the requested range, so spawn position is predictable in
-    isolated PatrolState tests that don't go through Swarm's real rng."""
+    isolated PatrolState tests that don't go through Swarm's real rng.
+    randint always returns the max of the range (max severity), unless
+    overridden per-test via a subclass -- most dispatch/pruning tests
+    don't care about severity, only the multi-investigator-specific tests
+    below do."""
 
     def uniform(self, a, b):
         return (a + b) / 2.0
+
+    def randint(self, a, b):
+        return b
 
 
 def _fake_swarm(drones: dict, mission: MissionState | None, width=300, height=300):
@@ -97,7 +104,7 @@ def test_dispatch_does_not_pull_a_zone_occupant_even_if_the_zone_is_oversupplied
     patrol.tick(swarm, 1)
 
     disturbance = next(iter(patrol.disturbances.values()))
-    assert disturbance.investigator_id is None
+    assert disturbance.investigator_ids == []
     assert set(mission.zone_statuses["Z"].occupant_ids) == {"A", "B"}  # untouched
 
 
@@ -119,7 +126,7 @@ def test_dispatch_pulls_from_the_idle_pool_not_zone_occupants():
 
     patrol._dispatch(swarm)
 
-    assigned_ids = {d.investigator_id for d in patrol.disturbances.values() if d.investigator_id}
+    assigned_ids = {iid for d in patrol.disturbances.values() for iid in d.investigator_ids}
     assert assigned_ids == {"idle1", "idle2"}  # both idle drones used, anchor untouched
     assert drones["anchor"].investigating_disturbance_id is None
 
@@ -138,7 +145,104 @@ def test_dispatch_picks_the_nearest_idle_drone():
 
     patrol._dispatch(swarm)
 
-    assert patrol.disturbances["d0"].investigator_id == "near"
+    assert patrol.disturbances["d0"].investigator_ids == ["near"]
+
+
+# -- Severity-scaled resourcing ------------------------------------------------
+
+def test_dispatch_scales_investigator_count_to_severity():
+    drones = {f"D{i}": Drone(id=f"D{i}", x=100 + i, y=100, priority=1) for i in range(5)}
+    mission = MissionState(MissionConfig(zones=()))
+    mission._occupants_of(drones)
+    patrol = PatrolState(PatrolConfig(), _FixedRng())
+    swarm = _fake_swarm(drones, mission, width=500, height=500)
+    patrol.disturbances["d0"] = Disturbance(id="d0", x=100, y=100, spawned_tick=0, severity=3)
+
+    patrol._dispatch(swarm)
+
+    assert len(patrol.disturbances["d0"].investigator_ids) == 3
+
+
+def test_dispatch_tops_up_an_underresourced_disturbance_on_a_later_call():
+    drones = {"D0": Drone(id="D0", x=100, y=100, priority=1)}
+    mission = MissionState(MissionConfig(zones=()))
+    mission._occupants_of(drones)
+    patrol = PatrolState(PatrolConfig(), _FixedRng())
+    swarm = _fake_swarm(drones, mission, width=500, height=500)
+    disturbance = Disturbance(id="d0", x=100, y=100, spawned_tick=0, severity=3)
+    patrol.disturbances["d0"] = disturbance
+
+    patrol._dispatch(swarm)
+    assert len(disturbance.investigator_ids) == 1  # only one idle drone existed
+
+    # A second drone frees up later (e.g. finished a mission) -- the next
+    # dispatch call should top the same disturbance up, not ignore it for
+    # already having "some" investigator.
+    drones["D1"] = Drone(id="D1", x=105, y=100, priority=1)
+    patrol._dispatch(swarm)
+
+    assert len(disturbance.investigator_ids) == 2
+
+
+def test_underresourced_disturbance_takes_longer_to_resolve_than_fully_resourced():
+    config = PatrolConfig(investigation_ticks_required=4, investigation_range=1000.0)
+    patrol = PatrolState(config, _FixedRng())
+    mission = MissionState(MissionConfig(zones=()))
+    swarm = _fake_swarm({}, mission, width=500, height=500)
+
+    fully_resourced = Disturbance(id="full", x=0, y=0, spawned_tick=0, severity=3,
+                                   investigator_ids=["A", "B", "C"])
+    underresourced = Disturbance(id="under", x=0, y=0, spawned_tick=0, severity=3,
+                                  investigator_ids=["X"])
+    swarm.drones.update({
+        "A": Drone(id="A", x=0, y=0, priority=1), "B": Drone(id="B", x=0, y=0, priority=1),
+        "C": Drone(id="C", x=0, y=0, priority=1), "X": Drone(id="X", x=0, y=0, priority=1),
+    })
+    patrol.disturbances["full"] = fully_resourced
+    patrol.disturbances["under"] = underresourced
+
+    for t in range(1, 5):  # required_effort = 3 * 4 = 12; 3/tick vs 1/tick
+        patrol._advance(swarm, t)
+
+    assert fully_resourced.resolved is True   # 4 ticks * 3 present/tick = 12 = required_effort
+    assert underresourced.resolved is False   # 4 ticks * 1 present/tick = 4 < 12
+
+
+def test_overresourcing_does_not_exceed_severity_accrual_rate():
+    config = PatrolConfig(investigation_ticks_required=10, investigation_range=1000.0)
+    patrol = PatrolState(config, _FixedRng())
+    mission = MissionState(MissionConfig(zones=()))
+    # 5 investigators piled onto a severity-2 disturbance (not reachable
+    # through normal _dispatch, which caps at severity -- constructed
+    # directly to isolate _advance's own capping behavior).
+    drones = {f"D{i}": Drone(id=f"D{i}", x=0, y=0, priority=1) for i in range(5)}
+    swarm = _fake_swarm(drones, mission, width=500, height=500)
+    disturbance = Disturbance(id="d0", x=0, y=0, spawned_tick=0, severity=2, investigator_ids=list(drones.keys()))
+    patrol.disturbances["d0"] = disturbance
+
+    patrol._advance(swarm, 1)
+
+    assert disturbance.ticks_investigated == 2  # capped at severity, not len(investigator_ids)=5
+
+
+def test_investigator_death_does_not_reset_accumulated_progress():
+    config = PatrolConfig(investigation_ticks_required=10, investigation_range=1000.0)
+    patrol = PatrolState(config, _FixedRng())
+    mission = MissionState(MissionConfig(zones=()))
+    drones = {"A": Drone(id="A", x=0, y=0, priority=1), "B": Drone(id="B", x=0, y=0, priority=1)}
+    swarm = _fake_swarm(drones, mission, width=500, height=500)
+    disturbance = Disturbance(id="d0", x=0, y=0, spawned_tick=0, severity=2, investigator_ids=["A", "B"])
+    patrol.disturbances["d0"] = disturbance
+
+    patrol._advance(swarm, 1)
+    assert disturbance.ticks_investigated == 2
+
+    drones["A"].alive = False  # A dies mid-investigation
+    patrol._advance(swarm, 2)
+
+    assert disturbance.ticks_investigated == 3  # 2 (kept) + 1 (B alone this tick) -- NOT reset to 0 or 1
+    assert "A" not in disturbance.investigator_ids
+    assert "B" in disturbance.investigator_ids
 
 
 # -- Resolved-disturbance pruning ---------------------------------------------
@@ -173,11 +277,8 @@ def test_investigation_requires_arrival_before_accruing_progress():
     swarm = Swarm(drones, comm_range=500, width=400, height=400, config=config, seed=2)
     _tick(swarm, 4)  # let the zone secure and a disturbance spawn+dispatch
 
-    investigator_id = next(
-        (d.investigator_id for d in swarm.patrol.disturbances.values() if d.investigator_id), None,
-    )
-    assert investigator_id is not None
-    disturbance = next(d for d in swarm.patrol.disturbances.values() if d.investigator_id == investigator_id)
+    disturbance = next((d for d in swarm.patrol.disturbances.values() if d.investigator_ids), None)
+    assert disturbance is not None
 
     # Immediately after dispatch the investigator is still travelling --
     # spawn_margin=200 in a 400x400 arena guarantees real distance to cover.
@@ -205,8 +306,8 @@ def test_investigator_death_returns_disturbance_to_market_and_clears_its_own_fie
     _tick(swarm, 4)
 
     disturbance = next(iter(swarm.patrol.disturbances.values()))
-    investigator_id = disturbance.investigator_id
-    assert investigator_id is not None
+    assert disturbance.investigator_ids
+    investigator_id = disturbance.investigator_ids[0]
 
     swarm.kill(investigator_id)
     _tick(swarm, 1)
@@ -215,7 +316,7 @@ def test_investigator_death_returns_disturbance_to_market_and_clears_its_own_fie
     # The disturbance either already picked up the other spare drone this
     # same tick, or is waiting for one -- either way it must not still
     # think the dead drone is on the case.
-    assert disturbance.investigator_id != investigator_id
+    assert investigator_id not in disturbance.investigator_ids
 
 
 def test_resolved_disturbance_frees_investigator_into_reserve_pool():
@@ -243,7 +344,7 @@ def test_resolved_disturbance_frees_investigator_into_reserve_pool():
         swarm.tick()
         just_resolved = [d for d in swarm.patrol.disturbances.values() if d.resolved]
         if just_resolved:
-            resolved_investigator_id = just_resolved[0].investigator_id
+            resolved_investigator_id = just_resolved[0].investigator_ids[0]
             break
 
     assert resolved_investigator_id is not None, "expected at least one disturbance to resolve within 200 ticks"
@@ -301,7 +402,7 @@ def test_patrol_inert_without_mission_config():
     _tick(swarm, 30)  # would be plenty of time to dispatch/resolve if it could
 
     assert len(swarm.patrol.disturbances) > 0  # spawning still happens
-    assert all(d.investigator_id is None for d in swarm.patrol.disturbances.values())
+    assert all(d.investigator_ids == [] for d in swarm.patrol.disturbances.values())
     assert all(d.resolved is False for d in swarm.patrol.disturbances.values())
     assert all(d.investigating_disturbance_id is None for d in swarm.drones.values())
 
@@ -322,7 +423,7 @@ def test_add_disturbance_bypasses_the_max_active_cap():
     assert len(patrol.disturbances) == 2
     placed = patrol.disturbances[new_id]
     assert (placed.x, placed.y) == (12.0, 34.0)
-    assert placed.investigator_id is None
+    assert placed.investigator_ids == []
 
 
 def test_add_disturbance_is_picked_up_by_the_next_dispatch():
@@ -340,7 +441,7 @@ def test_add_disturbance_is_picked_up_by_the_next_dispatch():
 
     patrol._dispatch(swarm)
 
-    assert patrol.disturbances[new_id].investigator_id == "idle"
+    assert "idle" in patrol.disturbances[new_id].investigator_ids
 
 
 # -- Patrol route ---------------------------------------------------------

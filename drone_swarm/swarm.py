@@ -309,11 +309,12 @@ class Swarm:
                         "disturbance": disturbance_id,
                     })
                 else:
+                    drone_ids = result["drone_ids"]
                     self.event_log.append({
                         "tick": self.tick_count,
                         "type": "disturbance_resolved",
-                        "detail": f"{result['drone_id']} resolved disturbance {disturbance_id}",
-                        "drone": result["drone_id"],
+                        "detail": f"{', '.join(drone_ids)} resolved disturbance {disturbance_id}",
+                        "drones": drone_ids,
                         "disturbance": disturbance_id,
                     })
 
