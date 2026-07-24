@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from antagonist.attacks import Antagonist
 from drone_swarm.command import CommandConfig
+from drone_swarm.commander_allocator import CommanderAllocatorConfig, HeuristicCommanderAllocator
 from drone_swarm.flocking import FlockingConfig
 from drone_swarm.mission import MissionConfig, Zone
 from drone_swarm.obstacles import Obstacle
@@ -115,12 +116,19 @@ MODE_SPECS = {
     # alongside it (180 -> 210) to keep the mesh reasonably connected at the
     # larger scale; verified live that the swarm still reliably converges on a
     # single nexus rather than fragmenting into permanent islands.
+    # commander_allocator is Scale-mode only, and deliberately never
+    # combined with bft_mode=True (Security, below) -- see command.py's
+    # "Dynamic platoon membership" for why that combination is an open
+    # problem this project doesn't attempt to solve.
     "scale": dict(n=100, width=2000, height=1280, comm_range=210,
                   config=SwarmConfig(max_relay_hops=2, mission_config=SCALE_MISSION,
                                       command_config=CommandConfig(platoon_of=_platoon_of(100, 10)),
                                       patrol_config=SCALE_PATROL,
                                       flocking_config=FlockingConfig(),
-                                      obstacles=SCALE_OBSTACLES)),
+                                      obstacles=SCALE_OBSTACLES,
+                                      commander_allocator=HeuristicCommanderAllocator(
+                                          CommanderAllocatorConfig(reallocation_interval_ticks=30),
+                                      ))),
     "security": dict(n=14, width=800, height=500, comm_range=180,
                       config=SwarmConfig(bft_mode=True, max_relay_hops=2,
                                           command_config=CommandConfig(platoon_of=_platoon_of(14, 4)))),

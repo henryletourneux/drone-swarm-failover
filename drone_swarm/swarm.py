@@ -92,6 +92,15 @@ class SwarmConfig:
     steers around them; a movement-only concept, not a radio one --
     obstacles never affect mesh connectivity (see obstacles.py's module
     docstring for why that's a deliberate scope line, not an oversight).
+
+    `commander_allocator` (see commander_allocator.py) makes platoon
+    membership dynamic — a commander periodically restructures who's in
+    which platoon and whether each drone is on guard or patrol duty.
+    None (default) means platoons stay exactly as `command_config.
+    platoon_of` configured them, forever, unaffected by this feature
+    existing at all. Only meaningful (and only ever set by server.py)
+    when `command_config` is also set and `bft_mode` is False — see
+    command.py's "Dynamic platoon membership" for why BFT is excluded.
     """
 
     max_relay_hops: int = 4
@@ -106,6 +115,7 @@ class SwarmConfig:
     patrol_config: object = None
     flocking_config: object = None
     obstacles: tuple = ()
+    commander_allocator: object = None
 
 
 class Swarm:
@@ -171,7 +181,10 @@ class Swarm:
         # Either way self.elections ends up {drone_id: NexusElection},
         # one per drone, and the rest of tick() doesn't need to know
         # which mode it's in.
-        self.command = CommandState(self.config.command_config, self.drones) if self.config.command_config is not None else None
+        self.command = (
+            CommandState(self.config.command_config, self.drones, allocator=self.config.commander_allocator)
+            if self.config.command_config is not None else None
+        )
         election_kwargs = dict(
             nexus_heartbeat_interval_s=self.config.nexus_heartbeat_interval_s,
             nexus_timeout_s=self.config.nexus_timeout_s,
@@ -337,6 +350,18 @@ class Swarm:
                         "drones": drone_ids,
                         "disturbance": disturbance_id,
                     })
+
+        if self.command is not None and self.command.allocator is not None:
+            # Runs after mission.tick()/patrol.tick(): needs this tick's
+            # fresh zone_statuses (who still needs guarding) and the
+            # commander election's own step earlier in this same tick
+            # (commander_ids() reflecting right now, not last tick).
+            if self.command.allocator.maybe_allocate(self):
+                self.event_log.append({
+                    "tick": self.tick_count,
+                    "type": "commander_reallocation",
+                    "detail": "commander restructured platoons and duties",
+                })
 
         if len(self.event_log) > MAX_EVENT_LOG:
             self.event_log = self.event_log[-MAX_EVENT_LOG:]

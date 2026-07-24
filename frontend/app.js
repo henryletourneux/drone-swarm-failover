@@ -29,6 +29,9 @@ const legendBattery = document.getElementById("legend-battery");
 const hudCommand = document.getElementById("hud-command");
 const platoonCountEl = document.getElementById("platoon-count");
 const commanderValueEl = document.getElementById("commander-value");
+const hudDuty = document.getElementById("hud-duty");
+const dutyGuardValueEl = document.getElementById("duty-guard-value");
+const dutyPatrolValueEl = document.getElementById("duty-patrol-value");
 const legendCommand = document.getElementById("legend-command");
 const legendPatrol = document.getElementById("legend-patrol");
 const legendRoute = document.getElementById("legend-route");
@@ -850,6 +853,18 @@ function renderCommandUI() {
   platoonCountEl.textContent = Object.keys(state.command.platoons).length;
   const commanders = state.command.commander_ids;
   commanderValueEl.textContent = commanders.length ? commanders.join(", ") : DASH;
+
+  // Commander-decided duty (drone_swarm/commander_allocator.py) -- only
+  // present once an allocator has actually run at least once, so the
+  // "GUARD 0 · PATROL 0" default never flashes before real data arrives.
+  const guardCount = state.drones.filter((d) => d.duty === "guard").length;
+  const patrolCount = state.drones.filter((d) => d.duty === "patrol").length;
+  const dutyActive = guardCount + patrolCount > 0;
+  hudDuty.style.display = dutyActive ? "" : "none";
+  if (dutyActive) {
+    dutyGuardValueEl.textContent = guardCount;
+    dutyPatrolValueEl.textContent = patrolCount;
+  }
 }
 
 // --- Event log --------------------------------------------------------------

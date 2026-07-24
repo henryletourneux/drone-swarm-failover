@@ -44,6 +44,36 @@ platoon nexuses independently elects its own, exactly mirroring the flat
 layer's own already-tested multi-nexus-under-partition behavior. That's
 why `commander_ids()` returns a list, not a single id: normally length
 0 or 1, honestly >= 2 under a real partition.
+
+## Dynamic platoon membership
+
+`platoon_of` starts as `CommandConfig`'s static seed but is no longer the
+source of truth after construction -- `CommandState.platoon_of` (a plain
+mutable dict) is, and `reassign_platoon()` is how it changes: move a
+drone to a different platoon slot, and it gets a brand-new, term-0
+election scoped to that platoon's layer. This is exactly the same
+"cold-join is always safe to absorb" reasoning already established above
+for the commander tier, one level down -- from the OLD platoon's point of
+view, the drone just went silent (a case Bully+recency already handles),
+and the NEW platoon absorbs a fresh follower the same way it would absorb
+any drone that just came back into range. `commander_allocator.py`'s
+`HeuristicCommanderAllocator` is what actually decides who moves where
+and why (see that module).
+
+**Deliberately restricted to plain (non-BFT) mode.** `election.py`'s own
+module docstring already states, in its own words, that this project
+"prioritizes defending against a minority of malicious/rogue nodes within
+a partition -- not ... truly dynamic membership," calling dynamic BFT
+membership "an open problem in real BFT systems too." Reassigning a
+drone gives its new platoon a correct `total_swarm_size` for the quorum
+threshold, but does NOT retroactively fix the OTHER members' elections,
+whose `total_swarm_size` was fixed at their own construction -- in plain
+mode that value is never consulted for anything (`_verify_quorum_
+certificate` is the only reader, and it's bft_mode-gated), so the
+staleness is inert; under bft_mode it would matter. Rather than solve
+that open problem, `server.py` simply never wires a commander allocator
+into a bft_mode config -- Security mode's platoons stay static, exactly
+as before this feature existed.
 """
 from __future__ import annotations
 
@@ -55,8 +85,10 @@ from .election import ElectionRole, NexusElection
 @dataclass(frozen=True)
 class CommandConfig:
     """`platoon_of` must map EVERY drone id in the swarm to a platoon id --
-    static, required, validated eagerly at `Swarm.__init__` (fail fast
-    rather than silently leaving a drone unassigned). Platoon formation
+    required, validated eagerly at `Swarm.__init__` (fail fast rather
+    than silently leaving a drone unassigned). This is only the STARTING
+    assignment now -- see "Dynamic platoon membership" above for how (and
+    under what restriction) it can change afterward. Platoon formation
     itself is deliberately not derived from topology/position here; that
     would be a much bigger, separate feature (coverage-path-planning-
     style area decomposition), not this one."""
@@ -65,12 +97,21 @@ class CommandConfig:
 
 
 class CommandState:
-    def __init__(self, config: CommandConfig, drones: dict) -> None:
+    def __init__(self, config: CommandConfig, drones: dict, allocator=None) -> None:
         missing = sorted(d_id for d_id in drones if d_id not in config.platoon_of)
         if missing:
             raise ValueError(f"CommandConfig.platoon_of is missing drone id(s): {missing}")
         self.config = config
+        # The live, mutable source of truth from here on -- config.platoon_of
+        # is only ever read again as this dict's initial seed, in
+        # build_platoon_elections below.
+        self.platoon_of: dict = dict(config.platoon_of)
         self.platoon_ids = sorted({config.platoon_of[d_id] for d_id in drones})
+        # None (default) means platoons stay exactly as configured,
+        # forever -- the original, fully backward-compatible behavior.
+        # Only set for modes that explicitly opt in (see module docstring
+        # for why bft_mode never does).
+        self.allocator = allocator
         # drone_id -> NexusElection, populated/depopulated every tick to
         # track whichever drones currently hold a platoon-nexus seat --
         # the one engine dict in this codebase that's dynamically
@@ -90,11 +131,11 @@ class CommandState:
         before `self` is fully constructed."""
         platoon_sizes: dict = {}
         for pid in self.platoon_ids:
-            platoon_sizes[pid] = sum(1 for d_id in drones if self.config.platoon_of[d_id] == pid)
+            platoon_sizes[pid] = sum(1 for d_id in drones if self.platoon_of[d_id] == pid)
 
         elections = {}
         for d_id, drone in drones.items():
-            pid = self.config.platoon_of[d_id]
+            pid = self.platoon_of[d_id]
             drone.platoon_id = pid
             elections[d_id] = NexusElection(
                 **base_kwargs,
@@ -105,6 +146,33 @@ class CommandState:
                 layer=f"platoon:{pid}",
             )
         return elections
+
+    def platoon_size(self, platoon_id: str) -> int:
+        return sum(1 for pid in self.platoon_of.values() if pid == platoon_id)
+
+    def reassign_platoon(self, swarm, drone_id: str, new_platoon_id: str) -> None:
+        """Moves `drone_id` into `new_platoon_id`, giving it a fresh,
+        term-0 election scoped to the new platoon's layer -- see
+        "Dynamic platoon membership" in the module docstring for why this
+        is safe. A no-op if the drone is already in that platoon (so
+        callers can call this unconditionally every reallocation pass
+        without churning elections for drones that didn't actually
+        move)."""
+        if self.platoon_of.get(drone_id) == new_platoon_id:
+            return
+        self.platoon_of[drone_id] = new_platoon_id
+        drone = swarm.drones[drone_id]
+        drone.platoon_id = new_platoon_id
+        swarm.elections[drone_id] = NexusElection(
+            nexus_heartbeat_interval_s=swarm.config.nexus_heartbeat_interval_s,
+            nexus_timeout_s=swarm.config.nexus_timeout_s,
+            bft_mode=swarm.config.bft_mode,
+            identity=swarm.identities.get(drone_id),
+            credential=swarm.credentials.get(drone_id),
+            registry=swarm.registry,
+            total_swarm_size=self.platoon_size(new_platoon_id),
+            layer=f"platoon:{new_platoon_id}",
+        )
 
     def commander_total_swarm_size(self) -> int:
         # Fixed: exactly one nexus seat per platoon is guaranteed by the
@@ -162,7 +230,7 @@ class CommandState:
     def to_state_dict(self, swarm) -> dict:
         platoons = {}
         for pid in self.platoon_ids:
-            member_ids = sorted(d_id for d_id in swarm.drones if self.config.platoon_of[d_id] == pid)
+            member_ids = sorted(d_id for d_id in swarm.drones if self.platoon_of[d_id] == pid)
             nexus_id = next(
                 (
                     d_id for d_id in member_ids

@@ -51,6 +51,12 @@ class Drone:
     platoon_id: str | None = None
     commander_id: str | None = None
 
+    # Commander-decided behavior category (drone_swarm/commander_allocator.py)
+    # -- inert (stays None) unless a CommandState.allocator is actually
+    # active. "guard" | "patrol"; a guard-duty drone additionally has
+    # mission_zone_id set to which zone it's guarding.
+    duty: str | None = None
+
     # Patrol/disturbance-investigation field (drone_swarm/patrol.py) -- inert
     # unless SwarmConfig.patrol_config is supplied, same additive-layer
     # principle as mission_zone_id/platoon_id above. Set while this drone is
@@ -73,4 +79,5 @@ class Drone:
             "platoon_id": self.platoon_id,
             "commander_id": self.commander_id,
             "investigating_disturbance_id": self.investigating_disturbance_id,
+            "duty": self.duty,
         }
