@@ -79,6 +79,7 @@ drone_swarm/
   election.py        # NexusElection — per-drone heartbeat/term-based Bully algorithm
   swarm.py            # Swarm: owns drones, the mesh, and every drone's election state
   metrics.py          # recovery time, election/message counters — see Metrics below
+  mission.py          # zone-coverage resource allocation — see Resource allocation below
   simulation.py      # random swarm generator
   cli.py               # headless terminal demo, no server needed
 antagonist/          # adversarial testing tool — see the BFT section below
@@ -125,13 +126,24 @@ source .venv/bin/activate
 pytest
 ```
 
+## Resource allocation: zone coverage under threat
+
+`drone_swarm/mission.py` is a genuinely new subsystem, not a bolt-on: the arena gets designated **zones** drones need to reach and hold, each requiring a minimum headcount to count as "secured." Every drone has a finite `battery` that drains with movement and drains *faster* while camped in an undersupported, contested zone (`threat_level > 0`) — running low doesn't destroy a drone (that's kill()/antagonist's job), it just makes it ineligible for further zone assignments, keeping this layer additive on top of the core election/mesh mechanics, the same principle `bft_mode` used.
+
+Allocation decisions are made by whichever drone is currently the elected nexus, on a fixed interval — a real tie back into the failover story: lose the nexus mid-mission and the newly-elected one has to pick up allocation duties. The baseline is `HeuristicAllocator`, a fully explainable, weighted greedy assignment (battery, distance, and a penalty for pulling a structurally load-bearing `relay` off its post in favor of a less-critical `leaf`) — the honest bar a future learned policy needs to clear to be worth using at all, not a strawman.
+
+**Honest simplification, stated plainly:** allocation currently runs with full, instantaneous knowledge of every drone's position and battery — an omniscient call made by the simulation (mirroring how role assignment already works), not routed through the mesh's own realistic, partial-information message-passing the way election is. That's a deliberate scope cut for this phase, and a natural next refinement — real uncertainty about drone state is exactly the kind of problem a learned policy would have a genuine reason to exist for, rather than just re-deriving the same heuristic weights.
+
+It's live in Scale mode's demo (three zones of varying threat) — watch drones peel off, travel, and hold position as zones fill and lock in `secured`.
+
 ## Roadmap / possible extensions
 
 This project is deliberately scoped to a working, well-tested core first. Natural next steps if extended further:
-- **Obstacle course / objectives**: give the swarm a goal beyond just staying coordinated — navigate a randomized course with barriers and scripted "turret" hazards that pick off whichever drone is currently nexus, forcing a real-time reassessment and re-election mid-navigation. Resource/task allocation (which drones go where, under what constraints) is a genuinely new subsystem, not a small add-on.
+- **A learned allocation policy**: train a model (RL from simulated rollouts, or supervised imitation of/improvement on the heuristic) against the mission environment above, evaluated honestly against `HeuristicAllocator` — if it doesn't beat the baseline, that's a real finding to report, not something to bury.
+- **Obstacle course**: scripted "turret" hazards and barriers layered onto zone navigation, picking off whichever drone is currently nexus mid-mission.
+- **Route allocation through the real mesh**: replace the omniscient allocation call above with actual status-report messages, including the possibility of stale/missing data.
 - **`bft_mode` at real scale**: closing the gap documented above — likely needs batching/amortizing verification rather than one Ed25519 op per message, not just more connectivity tuning.
 - **Rate limiting**: the antagonist's one documented, honest gap (flood/spam isn't currently mitigated at the resource level).
-- **Smarter resource allocation as the swarm scales**: starting with explainable, testable heuristics (e.g. weighted by position/load) rather than a trained model — the latter is closer to its own project than a feature.
 - **Extract `antagonist/` into its own project**: it's already scoped for this (see above) — a general-purpose adversarial mesh-network testing tool, not drone-specific in its core attack logic.
 - **Physical demo**: porting the coordination logic onto real hardware (e.g., an ESP-NOW mesh across a few ESP32 boards) or a software-in-the-loop simulator like ArduPilot/Gazebo.
 

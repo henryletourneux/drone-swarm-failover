@@ -266,6 +266,8 @@ canvas#swarm-canvas {
 .ev--election_started .ev-detail { color: #ffd873; }
 .ev--election_won { border-left-color: var(--won); }
 .ev--election_won .ev-detail { color: #86efac; }
+.ev--mission_assigned { border-left-color: var(--accent); }
+.ev--mission_assigned .ev-detail { color: #7dd3fc; }
 .ev--attack {
   border-left-color: #ff3b3b;
   background: rgba(255, 59, 59, 0.08);

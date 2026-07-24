@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 
@@ -7,6 +8,7 @@ from .election import ElectionRole, NexusElection
 from .identity import DroneIdentity, IdentityRegistry, SwarmAuthority
 from .mesh_network import MeshNetwork
 from .metrics import SwarmMetrics
+from .mission import MissionState
 from .topology import build_adjacency
 
 MAX_EVENT_LOG = 200
@@ -26,6 +28,11 @@ class SwarmConfig:
     default so the base coordination mechanism stays exactly as tested
     without it. Turn it on to run the swarm hardened against the
     antagonist/ package's attacks.
+
+    `mission_config` turns on zone-coverage resource allocation (see
+    mission.py) — None (default) means the mission system is entirely
+    inert, same principle as bft_mode: an additive layer, off by default,
+    zero effect on the base election/mesh tests without it.
     """
 
     max_relay_hops: int = 4
@@ -35,6 +42,7 @@ class SwarmConfig:
     nexus_timeout_s: float = 4.0
     tick_dt_s: float = 0.4
     bft_mode: bool = False
+    mission_config: object = None
 
 
 class Swarm:
@@ -116,6 +124,8 @@ class Swarm:
         # very first WebSocket message) still returns real edges.
         self._last_adjacency: dict = build_adjacency(self.drones, self.comm_range)
 
+        self.mission = MissionState(self.config.mission_config) if self.config.mission_config is not None else None
+
     def kill(self, drone_id: str) -> bool:
         drone = self.drones.get(drone_id)
         if drone is None or not drone.alive:
@@ -170,6 +180,20 @@ class Swarm:
         self._last_adjacency = build_adjacency(self.drones, self.comm_range)
         self._assign_roles(self._last_adjacency)
 
+        if self.mission is not None:
+            # Runs after role assignment: allocation needs to know who's
+            # currently nexus, and the relay/leaf distinction it weighs
+            # reassignment decisions by.
+            new_assignments = self.mission.tick(self)
+            for drone_id, zone_id in new_assignments:
+                self.event_log.append({
+                    "tick": self.tick_count,
+                    "type": "mission_assigned",
+                    "detail": f"{drone_id} assigned to zone {zone_id}",
+                    "drone": drone_id,
+                    "zone": zone_id,
+                })
+
         if len(self.event_log) > MAX_EVENT_LOG:
             self.event_log = self.event_log[-MAX_EVENT_LOG:]
 
@@ -219,7 +243,12 @@ class Swarm:
 
     def _move(self) -> None:
         for drone in self.drones.values():
-            if not drone.alive or (drone.vx == 0.0 and drone.vy == 0.0):
+            if not drone.alive:
+                continue
+            if self.mission is not None and drone.mission_zone_id is not None:
+                self._move_toward_zone(drone)
+                continue
+            if drone.vx == 0.0 and drone.vy == 0.0:
                 continue
             drone.x += drone.vx
             drone.y += drone.vy
@@ -229,6 +258,24 @@ class Swarm:
             if drone.y < 0.0 or drone.y > self.height:
                 drone.vy = -drone.vy
                 drone.y = max(0.0, min(self.height, drone.y))
+
+    def _move_toward_zone(self, drone) -> None:
+        """A drone with an active mission assignment steers directly for
+        its zone instead of drifting -- at the same speed magnitude it was
+        already moving at (falling back to a sane default for drones that
+        started stationary), holding position once comfortably inside the
+        zone's radius rather than orbiting or overshooting through it."""
+        status = self.mission.zone_statuses.get(drone.mission_zone_id)
+        if status is None:
+            return
+        zone = status.zone
+        dx, dy = zone.x - drone.x, zone.y - drone.y
+        distance = math.hypot(dx, dy)
+        speed = math.hypot(drone.vx, drone.vy) or 4.0
+        if distance <= max(zone.radius * 0.6, speed):
+            return
+        drone.x += dx / distance * speed
+        drone.y += dy / distance * speed
 
     def _assign_roles(self, adjacency: dict) -> None:
         for drone in self.drones.values():
@@ -245,7 +292,7 @@ class Swarm:
 
     def to_state_dict(self) -> dict:
         edges = sorted({tuple(sorted((a, b))) for a, neighbors in self._last_adjacency.items() for b in neighbors})
-        return {
+        state = {
             "tick": self.tick_count,
             "world": {"width": self.width, "height": self.height},
             "drones": [d.to_dict() for d in self.drones.values()],
@@ -253,3 +300,6 @@ class Swarm:
             "event_log": self.event_log[-30:],
             "metrics": self.metrics_snapshot(),
         }
+        if self.mission is not None:
+            state["mission"] = self.mission.to_state_dict()
+        return state

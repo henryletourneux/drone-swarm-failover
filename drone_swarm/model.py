@@ -32,6 +32,14 @@ class Drone:
     # Cosmetic, derived from graph position each tick: "nexus" | "relay" | "leaf" | "unassigned"
     role: str = "unassigned"
 
+    # Mission-system fields (drone_swarm/mission.py) -- inert unless a
+    # SwarmConfig.mission_config is actually supplied, so every hand-built
+    # Drone() in existing tests is unaffected. battery=100.0 (full) and
+    # mission_zone_id=None (unassigned) are the natural "not in a mission"
+    # defaults.
+    battery: float = 100.0
+    mission_zone_id: str | None = None
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -41,4 +49,6 @@ class Drone:
             "alive": self.alive,
             "nexus_id": self.nexus_id,
             "role": self.role,
+            "battery": round(self.battery, 1),
+            "mission_zone_id": self.mission_zone_id,
         }

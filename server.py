@@ -19,11 +19,25 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from antagonist.attacks import Antagonist
+from drone_swarm.mission import MissionConfig, Zone
 from drone_swarm.simulation import create_random_swarm
 from drone_swarm.swarm import SwarmConfig
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 TICK_SECONDS = 0.4  # matches SwarmConfig.tick_dt_s default, so 1 real second ~= 1 simulated second
+
+# Scale mode's resource-allocation mission -- see drone_swarm/mission.py.
+# Sized for the 1400x900 scale-mode arena; three zones of varying threat
+# so the heuristic allocator's threat-priority ordering is actually
+# exercised, not just distance/battery.
+SCALE_MISSION = MissionConfig(
+    zones=(
+        Zone(id="Z1", x=200, y=200, radius=80, required_drones=8, threat_level=1.0),
+        Zone(id="Z2", x=1200, y=700, radius=80, required_drones=6, threat_level=2.0),
+        Zone(id="Z3", x=700, y=450, radius=80, required_drones=10, threat_level=0.5),
+    ),
+    reallocation_interval_ticks=10,
+)
 
 # Two distinct live-demo modes, not one compromise config. Profiling found a
 # real tension: Ed25519 verification cost scales with message *volume*
@@ -35,12 +49,13 @@ TICK_SECONDS = 0.4  # matches SwarmConfig.tick_dt_s default, so 1 real second ~=
 # far too slow for smooth interactivity at any reasonable cadence. Rather
 # than fake it with a degraded mesh, each mode gets the config it's
 # actually good at:
-#   scale    -- 100 drones, plain mode, dense/rich connectivity, fast.
+#   scale    -- 100 drones, plain mode, dense/rich connectivity, fast,
+#               running the zone-coverage mission above.
 #   security -- 14 drones, bft_mode on, the antagonist has real defenses to
 #               demonstrate, already tuned to run comfortably.
 MODE_SPECS = {
     "scale": dict(n=100, width=1400, height=900, comm_range=180,
-                  config=SwarmConfig(max_relay_hops=2)),
+                  config=SwarmConfig(max_relay_hops=2, mission_config=SCALE_MISSION)),
     "security": dict(n=14, width=800, height=500, comm_range=180,
                       config=SwarmConfig(bft_mode=True, max_relay_hops=2)),
 }

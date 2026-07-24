@@ -108,9 +108,45 @@ function worldToScreen(x, y) {
 
 // --- Drawing ----------------------------------------------------------------
 
+// Threat-colored, dashed-until-secured mission zones (drone_swarm/mission.py),
+// drawn as the base layer so drones/edges render on top of them.
+function threatColor(threatLevel) {
+  if (threatLevel <= 0) return "110, 231, 183";   // mint -- uncontested
+  if (threatLevel < 1.5) return "245, 196, 81";   // amber -- moderate
+  return "255, 107, 94";                          // red -- heavily contested
+}
+
+function drawZones(zones) {
+  for (const zone of zones) {
+    const p = worldToScreen(zone.x, zone.y);
+    const r = zone.radius * scale;
+    const color = threatColor(zone.threat_level);
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${color}, ${zone.secured ? 0.12 : 0.06})`;
+    ctx.fill();
+
+    ctx.setLineDash(zone.secured ? [] : [6, 5]);
+    ctx.strokeStyle = `rgba(${color}, ${zone.secured ? 0.9 : 0.55})`;
+    ctx.lineWidth = zone.secured ? 2.5 : 1.5;
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.font = "600 11px SFMono-Regular, Menlo, monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = `rgba(${color}, 0.95)`;
+    const label = `${zone.id}  ${zone.occupants}/${zone.required_drones}${zone.secured ? " ✓" : ""}`;
+    ctx.fillText(label, p.x, p.y);
+  }
+}
+
 function draw() {
   const rect = canvas.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
+
+  if (state.mission) drawZones(state.mission.zones);
 
   const drones = interpolatedDrones();
   const byId = {};
@@ -401,6 +437,7 @@ const EV_LABEL = {
   election_won: "WON",
   swarms_merged: "MERGE",
   attack: "ATTACK",
+  mission_assigned: "MISSION",
 };
 
 const MAX_LOG_ROWS = 18;
