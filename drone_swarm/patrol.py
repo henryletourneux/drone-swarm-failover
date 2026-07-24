@@ -66,18 +66,42 @@ assignment (greedy and explainable over globally optimal).
 
 This module also owns *where idle drones actually go* while they wait for
 something to investigate, rather than leaving them to drift aimlessly
-(`Swarm._move`'s old default) or freeze in place. `patrol_target()`
-returns a single shared destination -- the current waypoint on a ring of
-points auto-generated inset from the arena edges (`_ring_waypoints`), so
-the whole idle population tours the arena's perimeter together as one
-flock (`flocking.py` does the actual steering; this only supplies the
-destination) rather than several small, independently-wandering groups.
-The route advances to its next waypoint once the idle population's own
-centroid arrives, not any single drone -- so a straggler at the back of
-the flock doesn't yank the target away from drones still converging on
+(`Swarm._move`'s old default) or freeze in place. Without hierarchical
+command (no `swarm.command`), `patrol_target(swarm)` returns a single
+shared destination -- the current waypoint on a ring of points auto-
+generated inset from the arena edges (`_ring_waypoints`), so the whole
+idle population tours the arena's perimeter together as one flock
+(`flocking.py` does the actual steering; this only supplies the
+destination). A route advances to its next waypoint once the relevant
+population's own centroid arrives, not any single drone -- so a straggler
+at the back doesn't yank the target away from drones still converging on
 the current one. `route_enabled` is a plain mutable flag (not part of the
 frozen `PatrolConfig`) so it can be toggled live from the running demo,
 same reasoning as `FlockingConfig` not being frozen (see flocking.py).
+
+## Per-platoon patrol routes
+
+With hierarchical command active, `patrol_target(swarm, platoon_id=...)`
+gives each platoon its OWN small loop -- circling whichever defendable
+mission zone it's nearest to in the platoon-id ordering (round-robin if
+there are more platoons than zones), sized just outside that zone's own
+radius (`zone_patrol_margin`), rather than the whole idle population
+sharing one arena-spanning ring. This was a real, live-observed problem
+with the single-shared-route design, not a hypothetical: a hundred
+drones all converging on ONE distant point at a time meant the "flock"
+routinely spanned nearly the entire arena width (measured live: >1500
+units wide in a 2000-unit arena, comm_range 210) rather than moving as a
+cohesive group -- reading as one shapeless blob rather than an organized
+patrol, AND scattering same-platoon drones far enough apart that they'd
+lose radio contact with each other entirely, fragmenting a single
+platoon's election into several simultaneous nexuses (the live demo's
+"too many nexuses, no relays" symptom traced directly back to this).
+Small, zone-anchored loops keep each platoon's own patrol population
+physically close together -- both a better read as an actual patrol
+pattern and healthier for the platoon's own mesh connectivity. Falls back
+to the same shared-ring behavior above if there's no mission (no zones to
+anchor to) or no `swarm.command` at all, so `patrol_config` alone (no
+`command_config`) is completely unaffected by this.
 """
 from __future__ import annotations
 
@@ -123,6 +147,13 @@ class PatrolConfig:
     route_waypoint_count: int = 8
     route_edge_margin: float = 120.0
     route_arrival_radius: float = 90.0
+    # Per-platoon patrol loops (see "Per-platoon patrol routes" below):
+    # how far outside a defendable zone's own radius the loop circling it
+    # sits, and how many points that loop has (smaller than the
+    # arena-perimeter route above -- a tight loop around one zone doesn't
+    # need as many points to read as a real patrol pattern).
+    zone_patrol_margin: float = 70.0
+    zone_patrol_waypoint_count: int = 5
 
 
 def _ring_waypoints(width: float, height: float, count: int, margin: float) -> list:
@@ -135,6 +166,35 @@ def _ring_waypoints(width: float, height: float, count: int, margin: float) -> l
     ry = max(1.0, height / 2.0 - margin)
     return [
         (cx + rx * math.cos(2 * math.pi * i / count), cy + ry * math.sin(2 * math.pi * i / count))
+        for i in range(count)
+    ]
+
+
+def platoon_zone_anchor(platoon_ids, zones: list, platoon_id: str):
+    """The zone a given platoon patrols around, via a stable round-robin
+    index%zones mapping (more platoons than zones is the common case) --
+    factored out here (rather than left inline in `_ensure_platoon_route`)
+    so `commander_allocator.py` can use the exact same mapping to send a
+    newly-available patrol drone to the slot that's actually nearest it,
+    not just whichever slot has the fewest members (see that module's own
+    "real bug found live" note for why that distinction matters). None if
+    there are no zones to anchor to."""
+    if not zones:
+        return None
+    sorted_platoon_ids = sorted(platoon_ids)
+    sorted_zones = sorted(zones, key=lambda z: z.id)
+    index = sorted_platoon_ids.index(platoon_id) if platoon_id in sorted_platoon_ids else 0
+    return sorted_zones[index % len(sorted_zones)]
+
+
+def _zone_loop_waypoints(zone, count: int, margin: float) -> list:
+    """A small ring of `count` points circling `zone` at `margin` outside
+    its own radius -- see "Per-platoon patrol routes" in the module
+    docstring for why an anchored, tight loop replaces one arena-spanning
+    shared ring."""
+    r = zone.radius + margin
+    return [
+        (zone.x + r * math.cos(2 * math.pi * i / count), zone.y + r * math.sin(2 * math.pi * i / count))
         for i in range(count)
     ]
 
@@ -157,6 +217,10 @@ class PatrolState:
         self.route_waypoints: list = []
         self.route_index: int = 0
         self.route_enabled: bool = True
+        # Per-platoon loops (see "Per-platoon patrol routes"), populated
+        # lazily per platoon_id the first time it's actually needed.
+        self.platoon_routes: dict = {}
+        self.platoon_route_index: dict = {}
 
     def _ensure_route(self, swarm) -> None:
         if self.route_waypoints:
@@ -172,15 +236,46 @@ class PatrolState:
             waypoints = [push_point_outside_all(x, y, obstacles) for x, y in waypoints]
         self.route_waypoints = waypoints
 
-    def patrol_target(self, swarm) -> tuple | None:
-        """The single shared destination idle/flocking drones should
-        currently steer toward, or None if patrol routing is off or there's
-        no idle population to lead (advancing a route that nobody is
-        actually walking would be meaningless). See "Patrol route" in the
-        module docstring for why this is one shared destination rather
-        than per-drone targets."""
+    def _ensure_platoon_route(self, swarm, platoon_id: str) -> None:
+        if platoon_id in self.platoon_routes:
+            return
+        zones = [status.zone for status in swarm.mission.zone_statuses.values()] if swarm.mission is not None else []
+        zone = platoon_zone_anchor(swarm.command.platoon_ids, zones, platoon_id)
+        if zone is None:
+            # No defendable areas to anchor to -- fall back to the same
+            # arena-perimeter ring every platoon would share anyway.
+            self._ensure_route(swarm)
+            self.platoon_routes[platoon_id] = self.route_waypoints
+            self.platoon_route_index[platoon_id] = 0
+            return
+
+        waypoints = _zone_loop_waypoints(zone, self.config.zone_patrol_waypoint_count, self.config.zone_patrol_margin)
+        obstacles = swarm.config.obstacles
+        if obstacles:
+            waypoints = [push_point_outside_all(x, y, obstacles) for x, y in waypoints]
+        self.platoon_routes[platoon_id] = waypoints
+        self.platoon_route_index[platoon_id] = 0
+
+    def patrol_target(self, swarm, platoon_id: str | None = None) -> tuple | None:
+        """The current destination the relevant population should steer
+        toward, or None if patrol routing is off. Without hierarchical
+        command (or when `platoon_id` isn't given), this is the single
+        shared arena-perimeter destination the WHOLE idle population
+        tours together. With it, `platoon_id` selects that platoon's own
+        small zone-anchored loop instead -- see "Per-platoon patrol
+        routes" in the module docstring for why. Either way, the route
+        advances once the relevant population's own centroid arrives, not
+        any single drone, so a straggler at the back doesn't yank the
+        target away from drones still converging on the current one."""
+        if not self.route_enabled:
+            return None
+        if platoon_id is None or swarm.command is None:
+            return self._global_patrol_target(swarm)
+        return self._platoon_patrol_target(swarm, platoon_id)
+
+    def _global_patrol_target(self, swarm) -> tuple | None:
         self._ensure_route(swarm)
-        if not self.route_enabled or not self.route_waypoints:
+        if not self.route_waypoints:
             return None
         idle = [
             d for d in swarm.drones.values()
@@ -195,6 +290,30 @@ class PatrolState:
         if math.hypot(centroid_x - target[0], centroid_y - target[1]) <= self.config.route_arrival_radius:
             self.route_index = (self.route_index + 1) % len(self.route_waypoints)
             target = self.route_waypoints[self.route_index]
+        return target
+
+    def _platoon_patrol_target(self, swarm, platoon_id: str) -> tuple | None:
+        self._ensure_platoon_route(swarm, platoon_id)
+        waypoints = self.platoon_routes.get(platoon_id)
+        if not waypoints:
+            return None
+        index = self.platoon_route_index.get(platoon_id, 0)
+        target = waypoints[index]
+
+        members = [
+            d for d in swarm.drones.values()
+            if d.alive and d.platoon_id == platoon_id
+            and d.mission_zone_id is None and d.investigating_disturbance_id is None
+        ]
+        if not members:
+            return target
+
+        centroid_x = sum(d.x for d in members) / len(members)
+        centroid_y = sum(d.y for d in members) / len(members)
+        if math.hypot(centroid_x - target[0], centroid_y - target[1]) <= self.config.route_arrival_radius:
+            index = (index + 1) % len(waypoints)
+            self.platoon_route_index[platoon_id] = index
+            target = waypoints[index]
         return target
 
     def _new_id(self) -> str:
@@ -369,4 +488,8 @@ class PatrolState:
             "route": [[x, y] for x, y in self.route_waypoints],
             "route_index": self.route_index,
             "route_enabled": self.route_enabled,
+            "platoon_routes": {
+                pid: {"route": [[x, y] for x, y in waypoints], "route_index": self.platoon_route_index.get(pid, 0)}
+                for pid, waypoints in self.platoon_routes.items()
+            },
         }

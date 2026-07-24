@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from drone_swarm.command import CommandConfig
 from drone_swarm.mission import MissionConfig, MissionState, Zone
 from drone_swarm.model import Drone
 from drone_swarm.obstacles import Obstacle, point_inside_any
-from drone_swarm.patrol import Disturbance, PatrolConfig, PatrolState, _ring_waypoints
+from drone_swarm.patrol import Disturbance, PatrolConfig, PatrolState, _ring_waypoints, platoon_zone_anchor
 from drone_swarm.swarm import Swarm, SwarmConfig
 
 FAST = SwarmConfig(
@@ -555,3 +556,77 @@ def test_to_state_dict_includes_patrol_only_when_configured():
     state = with_patrol.to_state_dict()
     assert "patrol" in state
     assert "disturbances" in state["patrol"]
+
+
+# -- Per-platoon patrol routes --------------------------------------------
+
+def test_platoon_zone_anchor_round_robins_across_more_platoons_than_zones():
+    zones = [Zone(id="ZA", x=0, y=0, radius=10, required_drones=1), Zone(id="ZB", x=100, y=100, radius=10, required_drones=1)]
+    platoon_ids = ["P0", "P1", "P2", "P3"]
+    # Sorted platoon order P0,P1,P2,P3 against sorted zone order ZA,ZB --
+    # index % 2 alternates.
+    assert platoon_zone_anchor(platoon_ids, zones, "P0").id == "ZA"
+    assert platoon_zone_anchor(platoon_ids, zones, "P1").id == "ZB"
+    assert platoon_zone_anchor(platoon_ids, zones, "P2").id == "ZA"
+    assert platoon_zone_anchor(platoon_ids, zones, "P3").id == "ZB"
+
+
+def test_platoon_zone_anchor_none_without_zones():
+    assert platoon_zone_anchor(["P0", "P1"], [], "P0") is None
+
+
+def test_ensure_platoon_route_anchors_to_the_correct_zone():
+    zone = Zone(id="Z", x=500, y=500, radius=50, required_drones=1)
+    mission = MissionState(MissionConfig(zones=(zone,)))
+    command = SimpleNamespace(platoon_ids=["P0", "P1"])
+    swarm = SimpleNamespace(mission=mission, command=command, width=1000, height=1000, config=SimpleNamespace(obstacles=()))
+    patrol = PatrolState(PatrolConfig(zone_patrol_margin=50.0, zone_patrol_waypoint_count=4), _FixedRng())
+
+    patrol._ensure_platoon_route(swarm, "P0")
+
+    waypoints = patrol.platoon_routes["P0"]
+    assert len(waypoints) == 4
+    # Every waypoint sits at exactly zone.radius + zone_patrol_margin from
+    # the zone center -- confirms it's a loop around THIS zone, not the
+    # generic arena-perimeter fallback.
+    for x, y in waypoints:
+        dist = ((x - zone.x) ** 2 + (y - zone.y) ** 2) ** 0.5
+        assert abs(dist - (zone.radius + 50.0)) < 1e-6
+
+
+def test_platoon_patrol_target_advances_independently_per_platoon():
+    zone_a = Zone(id="ZA", x=200, y=200, radius=20, required_drones=1)
+    zone_b = Zone(id="ZB", x=800, y=800, radius=20, required_drones=1)
+    mission = MissionState(MissionConfig(zones=(zone_a, zone_b)))
+    command = SimpleNamespace(platoon_ids=["P0", "P1"])
+    config = PatrolConfig(zone_patrol_margin=10.0, zone_patrol_waypoint_count=4, route_arrival_radius=5.0)
+    patrol = PatrolState(config, _FixedRng())
+
+    swarm = SimpleNamespace(
+        mission=mission, command=command, width=1000, height=1000, config=SimpleNamespace(obstacles=()),
+        drones={
+            "A": Drone(id="A", x=0, y=0, priority=1, platoon_id="P0"),
+            "B": Drone(id="B", x=0, y=0, priority=1, platoon_id="P1"),
+        },
+    )
+    first_target_p0 = patrol.patrol_target(swarm, platoon_id="P0")
+    first_target_p1 = patrol.patrol_target(swarm, platoon_id="P1")
+    assert first_target_p0 != first_target_p1  # different platoons, different zones, different targets
+
+    # Move ONLY P0's member onto its target -- P0's route must advance,
+    # P1's must not (independent per-platoon state).
+    swarm.drones["A"].x, swarm.drones["A"].y = first_target_p0
+    patrol.patrol_target(swarm, platoon_id="P0")
+    assert patrol.platoon_route_index["P0"] == 1
+    assert patrol.platoon_route_index.get("P1", 0) == 0
+
+
+def test_patrol_target_falls_back_to_global_route_without_command():
+    patrol = PatrolState(PatrolConfig(), _FixedRng())
+    swarm = _fake_swarm({"A": Drone(id="A", x=0, y=0, priority=1)}, None, width=400, height=400)
+    swarm.command = None
+
+    # Passing a platoon_id with no swarm.command must fall back to the
+    # single shared global route, not crash trying to read swarm.command.
+    target = patrol.patrol_target(swarm, platoon_id="P0")
+    assert target == patrol.route_waypoints[0]

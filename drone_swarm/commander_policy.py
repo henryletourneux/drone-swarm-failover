@@ -26,7 +26,8 @@ import math
 
 import torch
 
-from .commander_allocator import CommanderAllocatorConfig
+from .commander_allocator import CommanderAllocatorConfig, _assign_patrol_slots
+from .patrol import platoon_zone_anchor
 from .policy import AllocatorPolicy, drone_zone_features
 
 
@@ -125,9 +126,14 @@ class LearnedCommanderAllocator:
                     assignments[drone.id] = (pid, "guard", status.zone.id)
 
         remaining_slots = platoon_ids[slot_index:] or [platoon_ids[-1]]
-        for i, drone in enumerate(available):
-            pid = remaining_slots[i % len(remaining_slots)]
-            assignments[drone.id] = (pid, "patrol", None)
+        all_zones = [status.zone for status in swarm.mission.zone_statuses.values()] if swarm.mission is not None else []
+
+        def slot_anchor(pid):
+            zone = platoon_zone_anchor(command.platoon_ids, all_zones, pid)
+            return (zone.x, zone.y) if zone is not None else None
+
+        for drone_id, pid in _assign_patrol_slots(command, available, remaining_slots, slot_anchor).items():
+            assignments[drone_id] = (pid, "patrol", None)
 
         for d_id, (pid, duty, zone_id) in assignments.items():
             drone = swarm.drones[d_id]

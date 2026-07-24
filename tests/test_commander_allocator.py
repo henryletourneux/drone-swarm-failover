@@ -5,8 +5,10 @@ mission zone and who's on patrol, restructuring platoons to match.
 
 Same fast/lossless timing convention as test_command.py so convergence
 happens in a handful of ticks."""
+from types import SimpleNamespace
+
 from drone_swarm.command import CommandConfig
-from drone_swarm.commander_allocator import CommanderAllocatorConfig, HeuristicCommanderAllocator
+from drone_swarm.commander_allocator import CommanderAllocatorConfig, HeuristicCommanderAllocator, _assign_patrol_slots
 from drone_swarm.election import ElectionRole
 from drone_swarm.mission import MissionConfig, Zone
 from drone_swarm.model import Drone
@@ -200,3 +202,48 @@ def test_end_to_end_zones_get_guarded_and_the_rest_go_on_patrol():
     duties = {d.duty for d in swarm.drones.values()}
     assert "guard" in duties
     assert "patrol" in duties
+
+
+# -- _assign_patrol_slots: sticky + proximity-aware slot assignment ------------
+
+def _fake_command(platoon_of: dict):
+    return SimpleNamespace(
+        platoon_of=dict(platoon_of),
+        platoon_size=lambda pid, _po=platoon_of: sum(1 for p in _po.values() if p == pid),
+    )
+
+
+def test_assign_patrol_slots_keeps_an_already_patrolling_drone_in_place():
+    """Targeted regression for the real live-observed bug: a drone
+    already on patrol duty in a remaining slot must not get reassigned
+    just because a DIFFERENT slot currently has fewer members -- that was
+    the exact cause of 40-65 needless platoon reassignments (and a spike
+    from ~10 to 30-40+ simultaneous nexuses) every single reallocation
+    pass before this fix."""
+    command = _fake_command({"A": "P0", "B": "P1"})
+    drone_a = Drone(id="A", x=0, y=0, priority=1, duty="patrol")
+
+    assignments = _assign_patrol_slots(command, [drone_a], remaining_slots=["P0", "P1"])
+
+    assert assignments["A"] == "P0"  # stays put, even though P1 (0 members) is "more balanced"
+
+
+def test_assign_patrol_slots_sends_a_new_drone_to_the_nearest_tied_slot():
+    command = _fake_command({})  # nobody assigned yet -- both slots start at 0
+    new_drone = Drone(id="C", x=10, y=10, priority=1, duty=None)
+
+    def slot_anchor(pid):
+        return {"P0": (0, 0), "P1": (1000, 1000)}[pid]
+
+    assignments = _assign_patrol_slots(command, [new_drone], remaining_slots=["P0", "P1"], slot_anchor=slot_anchor)
+
+    assert assignments["C"] == "P0"  # far closer to P0's anchor than P1's
+
+
+def test_assign_patrol_slots_falls_back_to_balance_without_slot_anchor():
+    command = _fake_command({"A": "P0"})  # P0 already has 1 member, P1 has 0
+    new_drone = Drone(id="B", x=0, y=0, priority=1, duty=None)
+
+    assignments = _assign_patrol_slots(command, [new_drone], remaining_slots=["P0", "P1"])
+
+    assert assignments["B"] == "P1"  # balances onto the least-populated slot

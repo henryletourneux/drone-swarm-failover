@@ -10,6 +10,7 @@ Run with: uvicorn server:app --reload
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -33,37 +34,72 @@ TICK_SECONDS = 0.4  # matches SwarmConfig.tick_dt_s default, so 1 real second ~=
 
 # Scale mode's resource-allocation mission -- see drone_swarm/mission.py.
 # Sized for the 2000x1280 scale-mode arena (zoomed out from the original
-# 1400x900 to give the swarm more room to actually move/flock/patrol in --
-# coordinates below are the original zone layout scaled by the same
-# ~1.43x the arena grew by, so they sit in the same relative spots);
-# three zones of varying threat so the heuristic allocator's
-# threat-priority ordering is actually exercised, not just distance/battery.
-SCALE_MISSION = MissionConfig(
-    zones=(
-        Zone(id="Z1", x=280, y=280, radius=80, required_drones=8, threat_level=1.0),
-        Zone(id="Z2", x=1700, y=1000, radius=80, required_drones=6, threat_level=2.0),
-        Zone(id="Z3", x=1000, y=640, radius=80, required_drones=10, threat_level=0.5),
-    ),
-    reallocation_interval_ticks=10,
-    # base_drain_per_tick's default (0.01) applies to EVERY drone
-    # unconditionally forever, with no recharge mechanic -- bumping it
-    # broadly was tried first and nearly broke the whole demo (verified
-    # live: the entire 100-drone fleet drained to empty within ~5 real
-    # minutes regardless of what any drone was doing, so zones never even
-    # finished securing). secured_occupancy_drain_per_tick is a separate,
-    # targeted knob that only speeds up drones actively holding an
-    # already-secured zone, so idle/reserve/en-route drones keep the safe
-    # default lifespan while a relief dispatch still becomes observable
-    # within roughly 2-3 real minutes of a zone locking in "secured".
-    secured_occupancy_drain_per_tick=0.17,
-)
+# 1400x900 to give the swarm more room to actually move/flock/patrol in).
+#
+# Zone (defendable area) and obstacle (topology) layout are randomized
+# fresh on every server startup AND every "Reset Swarm" click -- a
+# deliberate environmental factor the commander has to actually respond
+# to each time, not a fixed map it could memorize, and not something the
+# operator can hand-configure from the UI (no manual editor exists or is
+# planned; see _random_zones/_random_obstacles below).
+SCALE_ZONE_COUNT = (3, 5)
+SCALE_ZONE_MARGIN = 150.0        # keeps zones off the arena edge
+SCALE_ZONE_MIN_SPACING = 260.0   # keeps randomly-placed zones from landing on top of each other
+SCALE_OBSTACLE_COUNT = (4, 7)
+SCALE_OBSTACLE_MARGIN = 100.0
 
-# Scale mode's mission only ever commits 24 of 100 drones to zones (8+6+10),
-# so there's always a large, genuinely idle pool for patrol.py's dispatch to
-# draw from (see patrol.py's module docstring for why "idle pool" and not
-# "zone surplus" is the real dispatch source) -- not wired into Security
-# mode, which has no mission_config at all, so patrol would just spawn
-# disturbances nobody ever investigates.
+
+def _random_zones(rng: random.Random, width: float, height: float) -> tuple:
+    """Randomized defendable areas. Rejection-sampled apart from each
+    other (up to a generous retry budget, then just placed -- a rare
+    close pair is fine, an infinite loop isn't) so the commander
+    genuinely has to spread guard duty across the map rather than one
+    lucky cluster covering everything at once."""
+    n_zones = rng.randint(*SCALE_ZONE_COUNT)
+    zones = []
+    for i in range(n_zones):
+        x = y = 0.0
+        for _ in range(30):
+            x = rng.uniform(SCALE_ZONE_MARGIN, width - SCALE_ZONE_MARGIN)
+            y = rng.uniform(SCALE_ZONE_MARGIN, height - SCALE_ZONE_MARGIN)
+            if all(math.hypot(x - z.x, y - z.y) >= SCALE_ZONE_MIN_SPACING for z in zones):
+                break
+        zones.append(Zone(
+            id=f"Z{i}", x=x, y=y, radius=rng.uniform(60.0, 90.0),
+            required_drones=rng.randint(5, 12), threat_level=rng.uniform(0.0, 3.0),
+        ))
+    return tuple(zones)
+
+
+def _random_obstacles(rng: random.Random, width: float, height: float, zones: tuple) -> tuple:
+    """Randomized topology, kept clear of the zones it was just handed
+    (a barrier swallowing an entire defendable area outright wouldn't
+    read as terrain, just as a broken map) and reasonably clear of each
+    other. patrol.py's own obstacle-awareness independently keeps patrol
+    routes/disturbance spawns nudged out of whatever lands here regardless."""
+    n_obstacles = rng.randint(*SCALE_OBSTACLE_COUNT)
+    obstacles = []
+    for i in range(n_obstacles):
+        x = y = 0.0
+        radius = 60.0
+        for _ in range(30):
+            x = rng.uniform(SCALE_OBSTACLE_MARGIN, width - SCALE_OBSTACLE_MARGIN)
+            y = rng.uniform(SCALE_OBSTACLE_MARGIN, height - SCALE_OBSTACLE_MARGIN)
+            radius = rng.uniform(40.0, 80.0)
+            clear_of_zones = all(math.hypot(x - z.x, y - z.y) >= z.radius + radius + 60.0 for z in zones)
+            clear_of_others = all(math.hypot(x - o.x, y - o.y) >= o.radius + radius + 30.0 for o in obstacles)
+            if clear_of_zones and clear_of_others:
+                break
+        obstacles.append(Obstacle(id=f"OB{i}", x=x, y=y, radius=radius))
+    return tuple(obstacles)
+
+
+# Scale mode's mission commits at most ~60 of 100 drones to zones (5-12
+# each, 3-5 zones), always leaving a genuinely idle pool for patrol.py's
+# dispatch to draw from (see patrol.py's module docstring for why "idle
+# pool" and not "zone surplus" is the real dispatch source) -- not wired
+# into Security mode, which has no mission_config at all, so patrol would
+# just spawn disturbances nobody ever investigates.
 SCALE_PATROL = PatrolConfig(
     spawn_interval_ticks=60,             # ~24 real seconds at TICK_SECONDS=0.4
     max_active_disturbances=2,
@@ -72,17 +108,37 @@ SCALE_PATROL = PatrolConfig(
     spawn_margin=60.0,
 )
 
-# Scattered clear of zone centers (SCALE_MISSION above) and each other, so
-# they read as real terrain to weave through rather than blocking any one
-# path outright -- patrol.py's own obstacle-awareness already keeps the
-# patrol route/disturbance spawns from landing inside one regardless.
-SCALE_OBSTACLES = (
-    Obstacle(id="OB1", x=700, y=300, radius=60),
-    Obstacle(id="OB2", x=1400, y=400, radius=70),
-    Obstacle(id="OB3", x=1000, y=900, radius=55),
-    Obstacle(id="OB4", x=500, y=950, radius=65),
-    Obstacle(id="OB5", x=1600, y=700, radius=50),
-)
+
+def _build_scale_config(rng: random.Random, width: float, height: float) -> SwarmConfig:
+    zones = _random_zones(rng, width, height)
+    mission_config = MissionConfig(
+        zones=zones,
+        reallocation_interval_ticks=10,
+        # base_drain_per_tick's default (0.01) applies to EVERY drone
+        # unconditionally forever, with no recharge mechanic -- bumping it
+        # broadly was tried first and nearly broke the whole demo (verified
+        # live: the entire 100-drone fleet drained to empty within ~5 real
+        # minutes regardless of what any drone was doing, so zones never
+        # even finished securing). secured_occupancy_drain_per_tick is a
+        # separate, targeted knob that only speeds up drones actively
+        # holding an already-secured zone, so idle/reserve/en-route drones
+        # keep the safe default lifespan while a relief dispatch still
+        # becomes observable within roughly 2-3 real minutes of a zone
+        # locking in "secured".
+        secured_occupancy_drain_per_tick=0.17,
+    )
+    return SwarmConfig(
+        max_relay_hops=2, mission_config=mission_config,
+        command_config=CommandConfig(platoon_of=_platoon_of(100, 10)),
+        patrol_config=SCALE_PATROL,
+        flocking_config=FlockingConfig(),
+        obstacles=_random_obstacles(rng, width, height, zones),
+        # commander_allocator is Scale-mode only, and deliberately never
+        # combined with bft_mode=True (Security, below) -- see command.py's
+        # "Dynamic platoon membership" for why that combination is an open
+        # problem this project doesn't attempt to solve.
+        commander_allocator=HeuristicCommanderAllocator(CommanderAllocatorConfig(reallocation_interval_ticks=30)),
+    )
 
 
 def _platoon_of(n: int, platoon_size: int) -> dict:
@@ -110,25 +166,17 @@ def _platoon_of(n: int, platoon_size: int) -> dict:
 #   security -- 14 drones, bft_mode on, the antagonist has real defenses to
 #               demonstrate, already tuned to run comfortably.
 MODE_SPECS = {
-    # width/height zoomed out from the original 1400x900 -- see SCALE_MISSION's
-    # comment above -- so 100 drones (plus flocking/patrolling ones) have real
+    # width/height zoomed out from the original 1400x900 -- so 100 drones
+    # (plus flocking/patrolling ones) have real
     # room to move rather than the arena reading as crowded. comm_range bumped
     # alongside it (180 -> 210) to keep the mesh reasonably connected at the
     # larger scale; verified live that the swarm still reliably converges on a
     # single nexus rather than fragmenting into permanent islands.
-    # commander_allocator is Scale-mode only, and deliberately never
-    # combined with bft_mode=True (Security, below) -- see command.py's
-    # "Dynamic platoon membership" for why that combination is an open
-    # problem this project doesn't attempt to solve.
-    "scale": dict(n=100, width=2000, height=1280, comm_range=210,
-                  config=SwarmConfig(max_relay_hops=2, mission_config=SCALE_MISSION,
-                                      command_config=CommandConfig(platoon_of=_platoon_of(100, 10)),
-                                      patrol_config=SCALE_PATROL,
-                                      flocking_config=FlockingConfig(),
-                                      obstacles=SCALE_OBSTACLES,
-                                      commander_allocator=HeuristicCommanderAllocator(
-                                          CommanderAllocatorConfig(reallocation_interval_ticks=30),
-                                      ))),
+    #
+    # No static "config" key here, unlike security below -- _build_scale_config
+    # builds a fresh one (fresh randomized zones/obstacles) on every call, see
+    # _build_swarm.
+    "scale": dict(n=100, width=2000, height=1280, comm_range=210),
     "security": dict(n=14, width=800, height=500, comm_range=180,
                       config=SwarmConfig(bft_mode=True, max_relay_hops=2,
                                           command_config=CommandConfig(platoon_of=_platoon_of(14, 4)))),
@@ -148,9 +196,13 @@ ATTACK_CHOICES = (
 
 def _build_swarm(selected_mode: str):
     spec = MODE_SPECS[selected_mode]
+    if selected_mode == "scale":
+        config = _build_scale_config(random.Random(), spec["width"], spec["height"])
+    else:
+        config = spec["config"]
     return create_random_swarm(
         n=spec["n"], width=spec["width"], height=spec["height"],
-        comm_range=spec["comm_range"], speed=6.0, config=spec["config"], seed=None,
+        comm_range=spec["comm_range"], speed=6.0, config=config, seed=None,
     )
 
 

@@ -464,14 +464,24 @@ class Swarm:
     def _move(self) -> None:
         flocking_config = self.config.flocking_config
         flock_grid = None
-        patrol_target = None
+        patrol_targets: dict = {}  # None -> global target, or platoon_id -> that platoon's own target
         if flocking_config is not None:
-            # One shared destination for the whole idle population (see
-            # patrol.py's "Patrol route"), computed once per tick here --
-            # not per drone below, which would recompute the idle
-            # centroid redundantly and could advance the route more than
-            # once in the same tick.
-            patrol_target = self.patrol.patrol_target(self) if self.patrol is not None else None
+            if self.patrol is not None:
+                if self.command is not None:
+                    # One destination PER platoon currently patrolling (see
+                    # patrol.py's "Per-platoon patrol routes"), computed once
+                    # per tick here -- not per drone below, which would
+                    # recompute each platoon's centroid redundantly and could
+                    # advance a route more than once in the same tick.
+                    patrolling_platoons = {
+                        d.platoon_id for d in self.drones.values()
+                        if d.alive and d.duty == "patrol"
+                        and d.investigating_disturbance_id is None and d.mission_zone_id is None
+                    }
+                    for pid in patrolling_platoons:
+                        patrol_targets[pid] = self.patrol.patrol_target(self, platoon_id=pid)
+                else:
+                    patrol_targets[None] = self.patrol.patrol_target(self)
             free_positions = {
                 d.id: (d.x, d.y) for d in self.drones.values()
                 if d.alive and d.investigating_disturbance_id is None and d.mission_zone_id is None
@@ -489,7 +499,8 @@ class Swarm:
                 self._move_toward_zone(drone)
                 continue
             if flocking_config is not None:
-                self._move_flocking(drone, flock_grid, flocking_config, patrol_target)
+                key = drone.platoon_id if self.command is not None else None
+                self._move_flocking(drone, flock_grid, flocking_config, patrol_targets.get(key))
                 continue
             if drone.vx == 0.0 and drone.vy == 0.0:
                 continue

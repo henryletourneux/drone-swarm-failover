@@ -32,11 +32,70 @@ around it would be actively counterproductive).
 Deliberately restricted to plain (non-BFT) mode -- see command.py's
 module docstring ("Dynamic platoon membership") for why. `server.py`
 never constructs one of these for a `bft_mode` config.
+
+**A real bug found live, not by a failing test**: the first version of
+patrol-slot spreading assigned drones to `remaining_slots` by list
+position (`enumerate(available)`), which reorders depending on which
+zones needed guards *this* pass -- so a drone already stably on patrol
+duty could get bounced into a different platoon on almost every single
+reallocation cycle even though its job never changed, each bounce
+forcing a fresh term-0 election for no operational reason. Confirmed
+live: 40-65 of 100 drones reassigned on every reallocation pass, spiking
+the live demo's nexus count from the expected ~10 (one per platoon) to
+30-40 and starving genuine relay/leaf convergence of the settling time
+it needs. `_assign_patrol_slots` below fixes this by keeping a drone
+that's already on patrol duty in whichever remaining slot it's already
+in -- only a drone whose duty is actually changing this pass (freed from
+guard, newly available, etc.) gets assigned to the currently
+least-populated slot.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+
+from .patrol import platoon_zone_anchor
+
+
+def _assign_patrol_slots(command, available: list, remaining_slots: list, slot_anchor=None) -> dict:
+    """Returns {drone_id: platoon_id} for `available` drones going on
+    patrol duty this pass -- see the module docstring's "real bug found
+    live" note for why this keeps already-patrolling drones sticky in
+    their current slot instead of reshuffling everyone by list position.
+
+    `slot_anchor(platoon_id) -> (x, y) | None`, if given, breaks ties
+    among the least-populated slots by which one is physically nearest
+    the drone -- a second real bug found live, after the stickiness fix
+    above: a newly-available drone could still get assigned to whichever
+    remaining slot had the fewest members with NO regard for where that
+    slot's own patrol loop actually is (see patrol.py's per-platoon
+    routes), sending it on an arena-spanning trek to a zone loop on the
+    opposite side of the map from wherever it happened to become
+    available. Confirmed live: some newly-freed drones took the entire
+    length of a test run to arrive at a slot chosen this way. Without
+    `slot_anchor` (or with no zones to anchor to), falls back to pure
+    least-populated balancing."""
+    slot_counts = {pid: command.platoon_size(pid) for pid in remaining_slots}
+    assignments: dict = {}
+    for drone in available:
+        current_pid = command.platoon_of.get(drone.id)
+        if drone.duty == "patrol" and current_pid in slot_counts:
+            pid = current_pid
+        else:
+            min_count = min(slot_counts.values())
+            candidates = [p for p in remaining_slots if slot_counts[p] == min_count]
+            if slot_anchor is not None and len(candidates) > 1:
+                anchored = [(p, slot_anchor(p)) for p in candidates]
+                anchored = [(p, a) for p, a in anchored if a is not None]
+                if anchored:
+                    pid = min(anchored, key=lambda pa: math.hypot(drone.x - pa[1][0], drone.y - pa[1][1]))[0]
+                else:
+                    pid = candidates[0]
+            else:
+                pid = candidates[0]
+            slot_counts[pid] += 1
+        assignments[drone.id] = pid
+    return assignments
 
 
 @dataclass(frozen=True)
@@ -119,9 +178,14 @@ class HeuristicCommanderAllocator:
                 assignments[drone.id] = (pid, "guard", zone.id)
 
         remaining_slots = platoon_ids[slot_index:] or [platoon_ids[-1]]
-        for i, drone in enumerate(available):
-            pid = remaining_slots[i % len(remaining_slots)]
-            assignments[drone.id] = (pid, "patrol", None)
+        all_zones = [status.zone for status in swarm.mission.zone_statuses.values()] if swarm.mission is not None else []
+
+        def slot_anchor(pid):
+            zone = platoon_zone_anchor(command.platoon_ids, all_zones, pid)
+            return (zone.x, zone.y) if zone is not None else None
+
+        for drone_id, pid in _assign_patrol_slots(command, available, remaining_slots, slot_anchor).items():
+            assignments[drone_id] = (pid, "patrol", None)
 
         for d_id, (pid, duty, zone_id) in assignments.items():
             drone = swarm.drones[d_id]
