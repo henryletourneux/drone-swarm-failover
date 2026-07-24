@@ -78,9 +78,23 @@ Both tiers run over the exact same mesh — there's no separate long-range radio
 
 **Honest limitation, stated plainly**: if the current platoon-nexus subgraph isn't fully reachable within `max_relay_hops` — dispersed platoons, a small `comm_range`, or a real partition — no single commander converges; each mutually-reachable cluster elects its own, exactly mirroring the flat layer's own already-tested multi-nexus-under-partition behavior. That's why `commander_ids()` returns a list, not a single id.
 
+### Dynamic platoon membership and duty (`SwarmConfig(commander_allocator=...)`)
+
+Platoons above start from a static, config-assigned `platoon_of` — but membership doesn't have to stay that way. `CommandState.reassign_platoon()` moves a drone into a different platoon by giving it a brand-new, term-0 election scoped to the new layer, reusing the exact same "cold-join is always safe to absorb" reasoning the module already relies on for the commander tier itself, one level down: from the old platoon's point of view, the drone just went silent, a case Bully+recency already handles.
+
+`drone_swarm/commander_allocator.py`'s `HeuristicCommanderAllocator` is what actually decides who moves where: periodically, once a commander is elected, it fills one platoon slot per still-undersupplied mission zone with the nearest available drones (**guard** duty, tied to that zone) and spreads everyone else across the remaining slots (**patrol** duty, joining the shared flocking/patrol-route population above). Deliberately mirrors `HeuristicAllocator`'s own honest, explainable, non-learned baseline role.
+
+**A real bug found and independently verified**: the reallocation pool didn't originally exclude drones already successfully guarding a secured zone. Since a secured zone stops appearing in "still needs drones" (precisely *because* that drone is the one filling it), those exact guards would get reassigned to patrol and walk away next pass — un-securing what they'd just secured, which re-triggered guard duty next pass, forever. Fixed by reusing the same "idle" definition (`mission_zone_id is None`) already established throughout `mission.py`/`patrol.py`; caught by an end-to-end test, independently re-verified by reintroducing the bug and confirming it fails.
+
+**Deliberately restricted to plain (non-BFT) mode.** `election.py`'s own module docstring already names "truly dynamic membership" under BFT as an open problem this project doesn't solve — reassigning a drone gives its new platoon a correct quorum threshold, but doesn't retroactively fix the other members' already-fixed one. Rather than solve that, `server.py` simply never wires a commander allocator into Security mode's `bft_mode=True` config; its platoons stay exactly as static as before this feature existed.
+
+**A trained alternative** — `drone_swarm/commander_policy.py`'s `LearnedCommanderAllocator` reuses `policy.py`'s own `AllocatorPolicy`/`drone_zone_features` directly rather than inventing a parallel architecture: "which drone should fill this zone slot" is the identical decision shape at both tiers. A fresh instance is trained specifically on the commander's own triggering cadence and candidate pool via `commander_train.py` (same REINFORCE approach as `train.py`, same two-phase discipline — heuristic first, a learned policy evaluated honestly against it second). **The honest result** (`python3 -m drone_swarm.commander_train --evaluate-only`, 40 held-out episodes): both reach 100% fully-secured, same average zones secured (1.43) — but the heuristic converges faster (36.6 ticks vs. 46.8) and leaves marginally more battery (98.5 vs. 98.0). Not a clean win, reported as-is, same principle as the zone-allocation policy's own evaluation below.
+
 ## Patrol and disturbance investigation (`SwarmConfig(patrol_config=...)`)
 
 `drone_swarm/patrol.py` spawns dynamic **disturbance** sites in the arena that the swarm's genuinely idle drones — alive, not currently holding a mission zone, not already investigating something else — break off to investigate: travel to the site, hold there accruing investigation time, and resolve it once enough time has passed. Built directly on top of `mission.py` rather than as a parallel system: dispatch reuses the exact same idle/reserve-pool notion `HeuristicAllocator.plan_substitutions()` already established for battery-substitution relief, and a resolved investigator is simply freed (`investigating_disturbance_id = None`) for `MissionState`'s own allocation/substitution machinery to pick back up — no bespoke "return to post" logic.
+
+**Proper resource allocation, not just "someone eventually looks into it"**: each disturbance carries a random `severity` (1-3), and resolving it takes that many drones' worth of *combined* presence — `_advance` accrues `min(currently-present investigators, severity)` effort per tick against a `severity × investigation_ticks_required` total, so sending fewer investigators than the situation calls for genuinely slows resolution down (proportionally, not a cliff), and sending more than needed doesn't speed it up further. `_dispatch` mirrors `HeuristicAllocator.allocate()`'s own shape almost exactly: keep assigning the nearest still-idle drone to whichever under-resourced disturbance needs it most (most severe, then longest-waiting) until every disturbance's headcount is met or idle drones run out. An investigator dying mid-investigation no longer resets accumulated progress to zero — only the vacancy needs backfilling, more realistic than punishing the whole effort for one loss.
 
 **A real design bug found while building this, worth naming**: the first version dispatched from a zone's *surplus* occupants (beyond `required_drones`) rather than the idle pool. That's a different failure mode than a typical off-by-one — `HeuristicAllocator.allocate()` never assigns more than a zone's `required_drones` in the first place, so genuine surplus essentially never occurs under any realistic mission configuration, meaning disturbances would spawn and simply never get investigated. Caught by two end-to-end tests that failed against the surplus-based version and pass against the idle-pool version (`test_investigation_requires_arrival_before_accruing_progress`, `test_resolved_disturbance_frees_investigator_into_reserve_pool`), independently re-verified by reintroducing the surplus-based logic and confirming seven tests fail against it before restoring the fix.
 
@@ -100,6 +114,17 @@ That "why" is `patrol.py`'s new patrol route: an elliptical ring of waypoints au
 
 Scale mode's arena was also widened (1400×900 → 2000×1280, comm_range nudged 180 → 210 to keep the mesh well-connected at the larger size) specifically so the flock and patrol route have real room to move rather than reading as crowded — verified live that nexus convergence and tick timing (~6ms/tick at 100 drones) are unaffected.
 
+## Topology and obstacles (`SwarmConfig(obstacles=...)`)
+
+`drone_swarm/obstacles.py` adds static circular barriers every movement mode — flocking, mission-zone travel, disturbance travel, and the plain drift-bounce fallback — bends around via a shared `Swarm._avoid_obstacles` helper. Deliberately a **movement-only** concept: obstacles never affect mesh connectivity (`mesh_network.py`'s comm-range/relay logic is untouched), since modeling real radio line-of-sight would mean reworking the already-carefully-tuned relay-flood logic rather than freely extending this feature.
+
+**Two real, independently-verified bugs, both genuine instances of the classic local-minimum trap in potential-field navigation:**
+
+- `push_point_outside_all` (keeps generated waypoints/disturbances from landing inside an obstacle) went through two broken versions first: leaping straight away from whichever obstacle was hit first could bounce forever between two deeply-overlapping obstacles; summing repulsion and taking small steps looked more principled but settled into a stable 2-point oscillation at the force-equilibrium point — not the same thing as "actually outside every obstacle." Fixed with an expanding-radius, all-angles search instead, which can't oscillate (no gradient to follow) and can't get trapped in a cancellation point (it tests candidates directly).
+- Real-time `obstacle_avoidance` (live steering) was purely radial at first — a drone travelling in a straight line with an obstacle directly on its path would stall exactly where the radial push equalled its own pull toward the target, and no amount of tuning fixes that, because "straight back" is the one direction that can exactly cancel "straight forward." Fixed by adding a tangential (edge-sliding) component that picks its rotation direction from the drone's own intended heading, so it curves the way it was already trying to go.
+
+Patrol route waypoints and disturbance spawns/placements are nudged clear of obstacles via the same expanding-search helper. Scale mode ships 5 scattered obstacles; confirmed no performance regression (~5ms/tick) and no drone left permanently stuck inside one.
+
 ## Project structure
 
 ```
@@ -116,7 +141,11 @@ drone_swarm/
   mission.py          # zone-coverage resource allocation — see Resource allocation below
   patrol.py            # disturbance investigation + patrol route — see Patrol and disturbance investigation / Flocking above
   flocking.py           # boid steering primitive — see Flocking and patrol route above
+  obstacles.py          # static circular barriers + avoidance steering — see Topology and obstacles above
   command.py          # hierarchical platoon/commander election — see Hierarchical command above
+  commander_allocator.py  # heuristic guard/patrol duty + dynamic platoon allocator — see Hierarchical command above
+  commander_policy.py     # learned commander allocator (PyTorch) — a drop-in for commander_allocator.py's heuristic
+  commander_train.py       # REINFORCE training + evaluation pipeline for commander_policy.py
   policy.py            # learned allocation policy (PyTorch) — a drop-in for mission.py's allocator
   train.py              # REINFORCE training + evaluation pipeline for policy.py
   simulation.py      # random swarm generator
@@ -124,7 +153,7 @@ drone_swarm/
 antagonist/          # adversarial testing tool — see the BFT section below
 server.py            # FastAPI + WebSocket server for the live browser demo (Scale / Security modes)
 frontend/            # canvas visualization (vanilla HTML/CSS/JS, no build step)
-tests/                 # pytest suite covering topology, mesh, election, swarm, BFT, metrics, mission, policy, command, patrol, and flocking behavior
+tests/                 # pytest suite covering topology, mesh, election, swarm, BFT, metrics, mission, policy, command, commander allocation/policy, patrol, flocking, and obstacle behavior
 ```
 
 ## Running it
@@ -209,10 +238,12 @@ python3 -m drone_swarm.train --evaluate-only        # load the committed model a
 ## Roadmap / possible extensions
 
 This project is deliberately scoped to a working, well-tested core first. Natural next steps if extended further:
-- **A better learned policy**: actor-critic instead of vanilla REINFORCE, to get past the plateau documented above.
-- **Live demo toggle**: swap `HeuristicAllocator` for the trained `LearnedAllocator` in Scale mode at runtime, so the comparison is visible, not just in an evaluation report.
-- **Obstacle course**: scripted "turret" hazards and barriers layered onto zone navigation, picking off whichever drone is currently nexus mid-mission.
-- **Route allocation through the real mesh**: replace the omniscient allocation call above with actual status-report messages, including the possibility of stale/missing data.
+- **A better learned policy**: actor-critic instead of vanilla REINFORCE, to get past the plateau documented above (applies to both the zone-allocation and commander policies).
+- **Live demo toggle**: swap the heuristic for the trained learned policy in Scale mode at runtime (mission-level `LearnedAllocator` and/or commander-level `LearnedCommanderAllocator`), so the comparison is visible, not just in an evaluation report.
+- **Moving/attacking obstacles**: static barriers exist now (see Topology and obstacles above); scripted "turret" hazards that actively pick off whichever drone is currently nexus mid-mission are a natural next layer on top.
+- **Per-platoon patrol routes**: the shared patrol route currently tours the *entire* idle population as one flock — giving each platoon its own route once patrol duty is platoon-scoped (see Hierarchical command's dynamic-membership section) is a natural, honestly-noted extension.
+- **Dynamic platoon membership under `bft_mode`**: deliberately not attempted (see Hierarchical command above) — `election.py` already names this an open problem in real BFT systems, not unique to this project.
+- **Route allocation through the real mesh**: replace the omniscient allocation calls above (mission-level and commander-level) with actual status-report messages, including the possibility of stale/missing data.
 - **`bft_mode` at real scale**: closing the gap documented above — likely needs batching/amortizing verification rather than one Ed25519 op per message, not just more connectivity tuning.
 - **Rate limiting**: the antagonist's one documented, honest gap (flood/spam isn't currently mitigated at the resource level).
 - **Extract `antagonist/` into its own project**: it's already scoped for this (see above) — a general-purpose adversarial mesh-network testing tool, not drone-specific in its core attack logic.
