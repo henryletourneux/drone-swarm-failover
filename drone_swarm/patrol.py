@@ -47,6 +47,23 @@ spawn on opposite sides of the arena in the same tick can each grab a
 suboptimal drone if a truly optimal assignment would have crossed them --
 the same honest tradeoff `HeuristicAllocator` already makes for zone
 assignment (greedy and explainable over globally optimal).
+
+## Patrol route
+
+This module also owns *where idle drones actually go* while they wait for
+something to investigate, rather than leaving them to drift aimlessly
+(`Swarm._move`'s old default) or freeze in place. `patrol_target()`
+returns a single shared destination -- the current waypoint on a ring of
+points auto-generated inset from the arena edges (`_ring_waypoints`), so
+the whole idle population tours the arena's perimeter together as one
+flock (`flocking.py` does the actual steering; this only supplies the
+destination) rather than several small, independently-wandering groups.
+The route advances to its next waypoint once the idle population's own
+centroid arrives, not any single drone -- so a straggler at the back of
+the flock doesn't yank the target away from drones still converging on
+the current one. `route_enabled` is a plain mutable flag (not part of the
+frozen `PatrolConfig`) so it can be toggled live from the running demo,
+same reasoning as `FlockingConfig` not being frozen (see flocking.py).
 """
 from __future__ import annotations
 
@@ -83,6 +100,25 @@ class PatrolConfig:
     # instant the last investigation tick lands.
     resolved_display_ticks: int = 8
 
+    # Patrol route (see "Patrol route" in the module docstring).
+    route_waypoint_count: int = 8
+    route_edge_margin: float = 120.0
+    route_arrival_radius: float = 90.0
+
+
+def _ring_waypoints(width: float, height: float, count: int, margin: float) -> list:
+    """An elliptical ring of `count` points inset `margin` from the arena
+    edges -- auto-derived from arena size rather than hardcoded, so a
+    bigger arena (more room to patrol) just produces a bigger ring for
+    free, no separate per-mode tuning needed."""
+    cx, cy = width / 2.0, height / 2.0
+    rx = max(1.0, width / 2.0 - margin)
+    ry = max(1.0, height / 2.0 - margin)
+    return [
+        (cx + rx * math.cos(2 * math.pi * i / count), cy + ry * math.sin(2 * math.pi * i / count))
+        for i in range(count)
+    ]
+
 
 class PatrolState:
     """Owns disturbance spawn/dispatch/investigate/resolve bookkeeping for
@@ -96,6 +132,44 @@ class PatrolState:
         self._ticks_since_spawn = 0
         self._next_id = 0
         self.disturbances: dict[str, Disturbance] = {}
+        # Route waypoints need arena dimensions, which this class doesn't
+        # have at construction time (only Swarm does) -- populated lazily
+        # on first tick() instead, same pattern as _spawn already uses.
+        self.route_waypoints: list = []
+        self.route_index: int = 0
+        self.route_enabled: bool = True
+
+    def _ensure_route(self, swarm) -> None:
+        if self.route_waypoints:
+            return
+        self.route_waypoints = _ring_waypoints(
+            swarm.width, swarm.height, self.config.route_waypoint_count, self.config.route_edge_margin,
+        )
+
+    def patrol_target(self, swarm) -> tuple | None:
+        """The single shared destination idle/flocking drones should
+        currently steer toward, or None if patrol routing is off or there's
+        no idle population to lead (advancing a route that nobody is
+        actually walking would be meaningless). See "Patrol route" in the
+        module docstring for why this is one shared destination rather
+        than per-drone targets."""
+        self._ensure_route(swarm)
+        if not self.route_enabled or not self.route_waypoints:
+            return None
+        idle = [
+            d for d in swarm.drones.values()
+            if d.alive and d.mission_zone_id is None and d.investigating_disturbance_id is None
+        ]
+        if not idle:
+            return self.route_waypoints[self.route_index]
+
+        centroid_x = sum(d.x for d in idle) / len(idle)
+        centroid_y = sum(d.y for d in idle) / len(idle)
+        target = self.route_waypoints[self.route_index]
+        if math.hypot(centroid_x - target[0], centroid_y - target[1]) <= self.config.route_arrival_radius:
+            self.route_index = (self.route_index + 1) % len(self.route_waypoints)
+            target = self.route_waypoints[self.route_index]
+        return target
 
     def _new_id(self) -> str:
         disturbance_id = f"disturbance-{self._next_id}"
@@ -231,4 +305,7 @@ class PatrolState:
                 }
                 for d in self.disturbances.values()
             ],
+            "route": [[x, y] for x, y in self.route_waypoints],
+            "route_index": self.route_index,
+            "route_enabled": self.route_enabled,
         }

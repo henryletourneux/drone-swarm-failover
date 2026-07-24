@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from antagonist.attacks import Antagonist
 from drone_swarm.command import CommandConfig
+from drone_swarm.flocking import FlockingConfig
 from drone_swarm.mission import MissionConfig, Zone
 from drone_swarm.patrol import PatrolConfig
 from drone_swarm.simulation import create_random_swarm
@@ -29,14 +30,17 @@ FRONTEND_DIR = Path(__file__).parent / "frontend"
 TICK_SECONDS = 0.4  # matches SwarmConfig.tick_dt_s default, so 1 real second ~= 1 simulated second
 
 # Scale mode's resource-allocation mission -- see drone_swarm/mission.py.
-# Sized for the 1400x900 scale-mode arena; three zones of varying threat
-# so the heuristic allocator's threat-priority ordering is actually
-# exercised, not just distance/battery.
+# Sized for the 2000x1280 scale-mode arena (zoomed out from the original
+# 1400x900 to give the swarm more room to actually move/flock/patrol in --
+# coordinates below are the original zone layout scaled by the same
+# ~1.43x the arena grew by, so they sit in the same relative spots);
+# three zones of varying threat so the heuristic allocator's
+# threat-priority ordering is actually exercised, not just distance/battery.
 SCALE_MISSION = MissionConfig(
     zones=(
-        Zone(id="Z1", x=200, y=200, radius=80, required_drones=8, threat_level=1.0),
-        Zone(id="Z2", x=1200, y=700, radius=80, required_drones=6, threat_level=2.0),
-        Zone(id="Z3", x=700, y=450, radius=80, required_drones=10, threat_level=0.5),
+        Zone(id="Z1", x=280, y=280, radius=80, required_drones=8, threat_level=1.0),
+        Zone(id="Z2", x=1700, y=1000, radius=80, required_drones=6, threat_level=2.0),
+        Zone(id="Z3", x=1000, y=640, radius=80, required_drones=10, threat_level=0.5),
     ),
     reallocation_interval_ticks=10,
     # base_drain_per_tick's default (0.01) applies to EVERY drone
@@ -91,10 +95,17 @@ def _platoon_of(n: int, platoon_size: int) -> dict:
 #   security -- 14 drones, bft_mode on, the antagonist has real defenses to
 #               demonstrate, already tuned to run comfortably.
 MODE_SPECS = {
-    "scale": dict(n=100, width=1400, height=900, comm_range=180,
+    # width/height zoomed out from the original 1400x900 -- see SCALE_MISSION's
+    # comment above -- so 100 drones (plus flocking/patrolling ones) have real
+    # room to move rather than the arena reading as crowded. comm_range bumped
+    # alongside it (180 -> 210) to keep the mesh reasonably connected at the
+    # larger scale; verified live that the swarm still reliably converges on a
+    # single nexus rather than fragmenting into permanent islands.
+    "scale": dict(n=100, width=2000, height=1280, comm_range=210,
                   config=SwarmConfig(max_relay_hops=2, mission_config=SCALE_MISSION,
                                       command_config=CommandConfig(platoon_of=_platoon_of(100, 10)),
-                                      patrol_config=SCALE_PATROL)),
+                                      patrol_config=SCALE_PATROL,
+                                      flocking_config=FlockingConfig())),
     "security": dict(n=14, width=800, height=500, comm_range=180,
                       config=SwarmConfig(bft_mode=True, max_relay_hops=2,
                                           command_config=CommandConfig(platoon_of=_platoon_of(14, 4)))),
@@ -208,6 +219,10 @@ def _handle_control_message(message: dict) -> None:
         _launch_random_attack()
     elif msg_type == "add_disturbance":
         _add_user_disturbance(message.get("x"), message.get("y"))
+    elif msg_type == "set_flocking":
+        _update_flocking_params(message)
+    elif msg_type == "set_patrol_route":
+        _set_patrol_route_enabled(message.get("enabled"))
 
 
 def _add_user_disturbance(x, y) -> None:
@@ -230,6 +245,37 @@ def _add_user_disturbance(x, y) -> None:
         "detail": f"disturbance {disturbance_id} placed by operator",
         "disturbance": disturbance_id,
     })
+
+
+FLOCKING_PARAM_BOUNDS = {
+    "separation": (0.0, 5.0, "separation_weight"),
+    "alignment": (0.0, 5.0, "alignment_weight"),
+    "cohesion": (0.0, 5.0, "cohesion_weight"),
+    "speed": (0.5, 12.0, "max_speed"),
+}
+
+
+def _update_flocking_params(message: dict) -> None:
+    """Live-tunes the running swarm's FlockingConfig in place (see
+    flocking.py's module docstring for why that config is mutable, unlike
+    every other one in this codebase) -- the whole point is a person
+    watching the demo can feel the effect of a slider change immediately,
+    without resetting the swarm and losing its current state. A no-op if
+    flocking isn't active in the current mode, or a value is missing/not
+    a number; each value is independently clamped to a sane range so a
+    malformed payload can't push the simulation into instability."""
+    fc = swarm.config.flocking_config
+    if fc is None:
+        return
+    for key, (lo, hi, attr) in FLOCKING_PARAM_BOUNDS.items():
+        value = message.get(key)
+        if isinstance(value, (int, float)):
+            setattr(fc, attr, max(lo, min(hi, float(value))))
+
+
+def _set_patrol_route_enabled(enabled) -> None:
+    if swarm.patrol is not None and isinstance(enabled, bool):
+        swarm.patrol.route_enabled = enabled
 
 
 def _current_nexus_id() -> str | None:

@@ -15,6 +15,7 @@
   --won: #5fe38a;
   --relief: #34d1c4;
   --commander: #c084fc;
+  --patrol: #818cf8;
   --mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", Consolas, "Liberation Mono", Menlo, monospace;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
@@ -227,6 +228,61 @@ canvas#swarm-canvas {
 }
 .ring--relief { border-color: var(--relief); }
 .ring--commander { border-color: var(--commander); box-shadow: 0 0 6px var(--commander); }
+.dot--patrol { background: var(--patrol); }
+
+.flock-panel {
+  position: absolute;
+  top: 14px; right: 14px;
+  width: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  background: rgba(10, 14, 20, 0.88);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px 11px;
+}
+.flock-panel-title {
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text);
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--border);
+}
+.flock-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 2px 8px;
+}
+.flock-row span:first-child { grid-column: 1; }
+.flock-row input[type="range"] {
+  grid-column: 1 / -1;
+  width: 100%;
+  accent-color: var(--patrol);
+  height: 14px;
+}
+.flock-val {
+  color: var(--patrol);
+  font-weight: 600;
+  text-align: right;
+  min-width: 2.4em;
+}
+.flock-toggle-row {
+  grid-template-columns: 1fr auto;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+  margin-top: 2px;
+}
+.flock-toggle-row input[type="checkbox"] {
+  grid-column: 2;
+  accent-color: var(--patrol);
+  width: 15px; height: 15px;
+}
 
 /* Log panel */
 .log-panel {

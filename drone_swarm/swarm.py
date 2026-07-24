@@ -6,11 +6,13 @@ from dataclasses import dataclass
 
 from .command import CommandState
 from .election import ElectionRole, NexusElection
+from .flocking import flock_velocity
 from .identity import DroneIdentity, IdentityRegistry, SwarmAuthority
 from .mesh_network import MeshNetwork
 from .metrics import SwarmMetrics
 from .mission import MissionState
 from .patrol import PatrolState
+from .spatial_grid import SpatialGrid
 from .topology import build_adjacency
 
 MAX_EVENT_LOG = 200
@@ -57,11 +59,20 @@ class SwarmConfig:
     every drone runs a single flat, swarm-wide election exactly as
     before, zero effect on the base tests without it.
 
-    `patrol_config` turns on disturbance investigation (see patrol.py):
-    dynamically-spawned disturbance sites that spare mission drones break
-    off to investigate — same additive principle, None (default) is
-    entirely inert. Has a soft dependency on `mission_config` also being
-    set (see patrol.py's module docstring for what happens without it).
+    `patrol_config` turns on disturbance investigation and patrol-route
+    movement (see patrol.py): dynamically-spawned disturbance sites that
+    idle drones break off to investigate, plus a shared patrol route idle
+    drones tour together the rest of the time — same additive principle,
+    None (default) is entirely inert. Has a soft dependency on
+    `mission_config` also being set (see patrol.py's module docstring for
+    what happens without it).
+
+    `flocking_config` turns on boid-style coordinated group movement (see
+    flocking.py) for drones with nothing else to do — None (default)
+    means those drones fall back to the old independent straight-line
+    drift-and-bounce, exactly as before this existed. Unlike every other
+    `*_config` here, `FlockingConfig` isn't frozen — it's meant to be
+    tuned live from the running demo, not fixed for the swarm's lifetime.
     """
 
     max_relay_hops: int = 4
@@ -74,6 +85,7 @@ class SwarmConfig:
     mission_config: object = None
     command_config: object = None
     patrol_config: object = None
+    flocking_config: object = None
 
 
 class Swarm:
@@ -183,6 +195,12 @@ class Swarm:
         # drawing from unrelated call sequences, so this doesn't correlate
         # disturbance placement with packet-loss rolls).
         self.patrol = PatrolState(self.config.patrol_config, random.Random(seed)) if self.config.patrol_config is not None else None
+        if self.patrol is not None:
+            # Eagerly, not lazily, for the same reason _last_adjacency is
+            # computed here too: a to_state_dict() call before the first
+            # tick() (e.g. serving the very first WebSocket message) should
+            # already show a real patrol route, not an empty one.
+            self.patrol._ensure_route(self)
 
     def kill(self, drone_id: str) -> bool:
         drone = self.drones.get(drone_id)
@@ -398,6 +416,23 @@ class Swarm:
                 self.metrics.record_commander_recovery(self.time_s - start)
 
     def _move(self) -> None:
+        flocking_config = self.config.flocking_config
+        flock_grid = None
+        patrol_target = None
+        if flocking_config is not None:
+            # One shared destination for the whole idle population (see
+            # patrol.py's "Patrol route"), computed once per tick here --
+            # not per drone below, which would recompute the idle
+            # centroid redundantly and could advance the route more than
+            # once in the same tick.
+            patrol_target = self.patrol.patrol_target(self) if self.patrol is not None else None
+            free_positions = {
+                d.id: (d.x, d.y) for d in self.drones.values()
+                if d.alive and d.investigating_disturbance_id is None and d.mission_zone_id is None
+            }
+            flock_grid = SpatialGrid(cell_size=max(flocking_config.neighbor_radius, 1.0))
+            flock_grid.rebuild(free_positions)
+
         for drone in self.drones.values():
             if not drone.alive:
                 continue
@@ -406,6 +441,9 @@ class Swarm:
                 continue
             if self.mission is not None and drone.mission_zone_id is not None:
                 self._move_toward_zone(drone)
+                continue
+            if flocking_config is not None:
+                self._move_flocking(drone, flock_grid, flocking_config, patrol_target)
                 continue
             if drone.vx == 0.0 and drone.vy == 0.0:
                 continue
@@ -417,6 +455,23 @@ class Swarm:
             if drone.y < 0.0 or drone.y > self.height:
                 drone.vy = -drone.vy
                 drone.y = max(0.0, min(self.height, drone.y))
+
+    def _move_flocking(self, drone, grid: SpatialGrid, flocking_config, target) -> None:
+        """Boid-style coordinated movement for a drone with nothing else
+        assigned (see flocking.py) -- steers together with nearby
+        similarly-free drones, optionally toward the shared patrol target,
+        instead of the old independent drift-and-bounce."""
+        neighbor_ids = grid.neighbors_within(drone.id, flocking_config.neighbor_radius)
+        neighbors = [self.drones[n_id] for n_id in neighbor_ids]
+        drone.vx, drone.vy = flock_velocity(drone, neighbors, flocking_config, target)
+        drone.x += drone.vx
+        drone.y += drone.vy
+        if drone.x < 0.0 or drone.x > self.width:
+            drone.vx = -drone.vx
+            drone.x = max(0.0, min(self.width, drone.x))
+        if drone.y < 0.0 or drone.y > self.height:
+            drone.vy = -drone.vy
+            drone.y = max(0.0, min(self.height, drone.y))
 
     def _move_toward_zone(self, drone) -> None:
         """A drone with an active mission assignment steers directly for
@@ -486,4 +541,12 @@ class Swarm:
             state["command"] = self.command.to_state_dict(self)
         if self.patrol is not None:
             state["patrol"] = self.patrol.to_state_dict()
+        if self.config.flocking_config is not None:
+            fc = self.config.flocking_config
+            state["flocking"] = {
+                "separation_weight": fc.separation_weight,
+                "alignment_weight": fc.alignment_weight,
+                "cohesion_weight": fc.cohesion_weight,
+                "max_speed": fc.max_speed,
+            }
         return state

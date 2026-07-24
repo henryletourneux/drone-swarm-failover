@@ -31,6 +31,20 @@ const platoonCountEl = document.getElementById("platoon-count");
 const commanderValueEl = document.getElementById("commander-value");
 const legendCommand = document.getElementById("legend-command");
 const legendPatrol = document.getElementById("legend-patrol");
+const legendRoute = document.getElementById("legend-route");
+
+const flockPanel = document.getElementById("flock-panel");
+const flockSeparation = document.getElementById("flock-separation");
+const flockAlignment = document.getElementById("flock-alignment");
+const flockCohesion = document.getElementById("flock-cohesion");
+const flockSpeed = document.getElementById("flock-speed");
+const flockPatrolToggle = document.getElementById("flock-patrol-toggle");
+const flockVal = {
+  separation: document.getElementById("flock-separation-val"),
+  alignment: document.getElementById("flock-alignment-val"),
+  cohesion: document.getElementById("flock-cohesion-val"),
+  speed: document.getElementById("flock-speed-val"),
+};
 
 const stat = {
   recoveryMean: document.getElementById("stat-recovery-mean"),
@@ -178,6 +192,55 @@ function drawZones(zones) {
   }
 }
 
+// Patrol route (drone_swarm/patrol.py's "Patrol route"): a faint dashed
+// ring connecting the auto-generated waypoints the idle swarm tours
+// together, with the currently-active waypoint pulsing distinctly so it
+// reads as "the flock is headed there next," not just a static shape.
+function drawPatrolRoute(patrol) {
+  const route = patrol.route;
+  if (!route || route.length < 2) return;
+
+  ctx.save();
+  ctx.setLineDash([3, 7]);
+  ctx.strokeStyle = "rgba(129, 140, 248, 0.28)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  route.forEach(([x, y], i) => {
+    const p = worldToScreen(x, y);
+    if (i === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  });
+  ctx.closePath();
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  for (const [x, y] of route) {
+    const p = worldToScreen(x, y);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(129, 140, 248, 0.4)";
+    ctx.fill();
+  }
+
+  if (patrol.route_enabled) {
+    const target = route[patrol.route_index];
+    if (target) {
+      const p = worldToScreen(target[0], target[1]);
+      const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 300);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 5 + pulse * 4, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(129, 140, 248, 0.85)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(129, 140, 248, 0.9)";
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
 // Disturbance sites (drone_swarm/patrol.py): a pulsing marker with a
 // progress ring that fills as the dispatched investigator accrues
 // investigation time, plus a dashed line out to whichever drone is
@@ -235,6 +298,7 @@ function draw() {
   ctx.clearRect(0, 0, rect.width, rect.height);
 
   if (state.mission) drawZones(state.mission.zones);
+  if (state.patrol) drawPatrolRoute(state.patrol);
 
   const drones = interpolatedDrones();
   const byId = {};
@@ -638,6 +702,84 @@ function renderModeUI() {
   attackBtn.style.display = state.mode === "security" ? "" : "none";
   legendBattery.style.display = state.mission ? "" : "none";
   legendPatrol.style.display = state.patrol ? "" : "none";
+  legendRoute.style.display = state.patrol ? "" : "none";
+}
+
+// --- Flocking controls -------------------------------------------------------
+//
+// A person watching should be able to actually feel what turning
+// separation/alignment/cohesion up or down does to the flock, live --
+// so slider input is throttled (not debounced: the last drag position
+// always lands, it just can't flood the socket faster than this) rather
+// than only sending on release.
+function throttle(fn, ms) {
+  let last = 0;
+  let timer = null;
+  return (...args) => {
+    const now = performance.now();
+    const remaining = ms - (now - last);
+    if (remaining <= 0) {
+      last = now;
+      clearTimeout(timer);
+      fn(...args);
+    } else {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        last = performance.now();
+        fn(...args);
+      }, remaining);
+    }
+  };
+}
+
+function updateFlockValueLabels() {
+  flockVal.separation.textContent = parseFloat(flockSeparation.value).toFixed(1);
+  flockVal.alignment.textContent = parseFloat(flockAlignment.value).toFixed(1);
+  flockVal.cohesion.textContent = parseFloat(flockCohesion.value).toFixed(1);
+  flockVal.speed.textContent = parseFloat(flockSpeed.value).toFixed(1);
+}
+
+const sendFlockingParams = throttle(() => {
+  send({
+    type: "set_flocking",
+    separation: parseFloat(flockSeparation.value),
+    alignment: parseFloat(flockAlignment.value),
+    cohesion: parseFloat(flockCohesion.value),
+    speed: parseFloat(flockSpeed.value),
+  });
+}, 120);
+
+[flockSeparation, flockAlignment, flockCohesion, flockSpeed].forEach((el) => {
+  el.addEventListener("input", () => {
+    updateFlockValueLabels();
+    sendFlockingParams();
+  });
+});
+
+flockPatrolToggle.addEventListener("change", () => {
+  send({ type: "set_patrol_route", enabled: flockPatrolToggle.checked });
+});
+
+// Sliders are synced FROM the server once per mode (so they open already
+// showing the real backend defaults, e.g. after a Reset) and then left
+// alone -- re-syncing on every incoming state message would fight the
+// user's own drag input, since the server echoes back whatever was just
+// set anyway.
+let flockPanelSyncedForMode = null;
+function renderFlockingUI() {
+  const present = !!state.flocking;
+  flockPanel.style.display = present ? "" : "none";
+  if (!present) return;
+
+  if (flockPanelSyncedForMode !== state.mode) {
+    flockPanelSyncedForMode = state.mode;
+    flockSeparation.value = state.flocking.separation_weight;
+    flockAlignment.value = state.flocking.alignment_weight;
+    flockCohesion.value = state.flocking.cohesion_weight;
+    flockSpeed.value = state.flocking.max_speed;
+    updateFlockValueLabels();
+    if (state.patrol) flockPatrolToggle.checked = state.patrol.route_enabled;
+  }
 }
 
 // Unlike renderModeUI, this runs every message (not gated on mode change):
@@ -805,6 +947,7 @@ function connect() {
 
     renderModeUI();
     renderCommandUI();
+    renderFlockingUI();
 
     // Wherever the interpolation currently is (not necessarily fully
     // caught up yet) becomes the new starting point, so a message that

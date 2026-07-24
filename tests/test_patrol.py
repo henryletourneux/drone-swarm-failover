@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 from drone_swarm.mission import MissionConfig, MissionState, Zone
 from drone_swarm.model import Drone
-from drone_swarm.patrol import Disturbance, PatrolConfig, PatrolState
+from drone_swarm.patrol import Disturbance, PatrolConfig, PatrolState, _ring_waypoints
 from drone_swarm.swarm import Swarm, SwarmConfig
 
 FAST = SwarmConfig(
@@ -341,6 +341,80 @@ def test_add_disturbance_is_picked_up_by_the_next_dispatch():
     patrol._dispatch(swarm)
 
     assert patrol.disturbances[new_id].investigator_id == "idle"
+
+
+# -- Patrol route ---------------------------------------------------------
+
+def test_ring_waypoints_count_and_inset_from_edges():
+    points = _ring_waypoints(width=1000, height=600, count=8, margin=100)
+
+    assert len(points) == 8
+    for x, y in points:
+        assert 100 - 1e-6 <= x <= 900 + 1e-6
+        assert 100 - 1e-6 <= y <= 500 + 1e-6
+
+
+def test_patrol_target_none_when_route_disabled():
+    patrol = PatrolState(PatrolConfig(), _FixedRng())
+    swarm = _fake_swarm({"A": Drone(id="A", x=0, y=0, priority=1)}, None, width=400, height=400)
+    patrol.route_enabled = False
+
+    assert patrol.patrol_target(swarm) is None
+
+
+def test_patrol_target_advances_once_idle_centroid_arrives():
+    config = PatrolConfig(route_waypoint_count=4, route_edge_margin=0, route_arrival_radius=5.0)
+    patrol = PatrolState(config, _FixedRng())
+    patrol._ensure_route(_fake_swarm({}, None, width=100, height=100))
+    first_target = patrol.route_waypoints[0]
+
+    # Idle drone sitting right on top of the first waypoint -- well within
+    # route_arrival_radius.
+    drones = {"A": Drone(id="A", x=first_target[0], y=first_target[1], priority=1)}
+    swarm = _fake_swarm(drones, None, width=100, height=100)
+
+    target = patrol.patrol_target(swarm)
+
+    assert patrol.route_index == 1
+    assert target == patrol.route_waypoints[1]
+
+
+def test_patrol_target_does_not_advance_while_still_approaching():
+    config = PatrolConfig(route_waypoint_count=4, route_edge_margin=0, route_arrival_radius=5.0)
+    patrol = PatrolState(config, _FixedRng())
+    swarm = _fake_swarm({}, None, width=1000, height=1000)
+    patrol._ensure_route(swarm)
+
+    # Idle drone far from the current (index 0) waypoint.
+    drones = {"A": Drone(id="A", x=0, y=0, priority=1)}
+    swarm = _fake_swarm(drones, None, width=1000, height=1000)
+
+    target = patrol.patrol_target(swarm)
+
+    assert patrol.route_index == 0
+    assert target == patrol.route_waypoints[0]
+
+
+def test_patrol_target_with_no_idle_population_returns_current_without_advancing():
+    patrol = PatrolState(PatrolConfig(route_waypoint_count=4), _FixedRng())
+    swarm = _fake_swarm({}, None, width=500, height=500)  # no drones at all
+
+    target = patrol.patrol_target(swarm)
+
+    assert patrol.route_index == 0
+    assert target == patrol.route_waypoints[0]
+
+
+def test_swarm_populates_route_eagerly_before_first_tick():
+    patrol_config = PatrolConfig(spawn_interval_ticks=100)
+    config = SwarmConfig(**{**FAST.__dict__, "patrol_config": patrol_config})
+    swarm = Swarm([Drone(id="A", x=0, y=0, priority=1)], comm_range=100, width=800, height=500, config=config, seed=1)
+
+    # No .tick() called yet -- route should already be real, not empty,
+    # matching _last_adjacency's same eager-init treatment for the same
+    # "first WebSocket message before the first tick" reason.
+    state = swarm.to_state_dict()
+    assert len(state["patrol"]["route"]) == patrol_config.route_waypoint_count
 
 
 def test_to_state_dict_includes_patrol_only_when_configured():

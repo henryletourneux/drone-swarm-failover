@@ -42,6 +42,34 @@
           <span class="legend-item" id="legend-battery"><i class="ring ring--relief"></i>battery ring</span>
           <span class="legend-item" id="legend-command" style="display:none"><i class="ring ring--commander"></i>platoon ring · commander</span>
           <span class="legend-item" id="legend-patrol" style="display:none">! disturbance</span>
+          <span class="legend-item" id="legend-route" style="display:none"><i class="dot dot--patrol"></i>patrol route</span>
+        </div>
+        <div class="flock-panel" id="flock-panel" style="display:none">
+          <div class="flock-panel-title">Flocking</div>
+          <label class="flock-row">
+            <span>Separation</span>
+            <span class="flock-val" id="flock-separation-val">0</span>
+            <input type="range" id="flock-separation" min="0" max="3" step="0.1" />
+          </label>
+          <label class="flock-row">
+            <span>Alignment</span>
+            <span class="flock-val" id="flock-alignment-val">0</span>
+            <input type="range" id="flock-alignment" min="0" max="3" step="0.1" />
+          </label>
+          <label class="flock-row">
+            <span>Cohesion</span>
+            <span class="flock-val" id="flock-cohesion-val">0</span>
+            <input type="range" id="flock-cohesion" min="0" max="3" step="0.1" />
+          </label>
+          <label class="flock-row">
+            <span>Speed</span>
+            <span class="flock-val" id="flock-speed-val">0</span>
+            <input type="range" id="flock-speed" min="1" max="10" step="0.5" />
+          </label>
+          <label class="flock-row flock-toggle-row">
+            <span>Patrol route</span>
+            <input type="checkbox" id="flock-patrol-toggle" checked />
+          </label>
         </div>
       </section>
 
@@ -74,8 +102,8 @@
       </div>
     </section>
 
-    <footer class="hint">Click any live drone to shoot it down, or click empty space to place a disturbance for the swarm to investigate (⚡ Scale mode). Launch Attack throws a forged message from a rogue transmitter — watch the security stat and event log.</footer>
+    <footer class="hint">Click any live drone to shoot it down, or click empty space to place a disturbance for the swarm to investigate (⚡ Scale mode). Use the Flocking panel to tune how the idle swarm moves and patrols in real time. Launch Attack throws a forged message from a rogue transmitter — watch the security stat and event log.</footer>
   </div>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

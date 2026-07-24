@@ -88,7 +88,17 @@ Both tiers run over the exact same mesh — there's no separate long-range radio
 
 **Honest limitation, stated plainly**: dispatch is greedy and single-pass, not globally optimal — each unresolved disturbance (oldest first) claims the single nearest currently-idle drone, one at a time. Two disturbances spawning on opposite sides of the arena in the same tick can each grab a suboptimal drone if a truly optimal assignment would have crossed them — the same tradeoff `HeuristicAllocator` already makes for zone assignment (greedy and explainable over globally optimal). It's also a soft dependency on `mission_config`: without an active mission there's no notion of "committed," so disturbances spawn and age but are never dispatched — nothing breaks, they just never resolve.
 
-Live in Scale mode's demo: a pulsing `!` marker with a fill-up progress ring shows each active disturbance, with a dashed line out to whichever drone is currently investigating it; it turns into a `✓` briefly on resolution before disappearing.
+Live in Scale mode's demo: a pulsing `!` marker with a fill-up progress ring shows each active disturbance, with a dashed line out to whichever drone is currently investigating it; it turns into a `✓` briefly on resolution before disappearing. Clicking any empty patch of arena places a disturbance there directly (bypassing `max_active_disturbances` — a deliberate one-off action isn't the ambient spawn traffic that cap exists to throttle), with a crosshair cursor over empty space signaling the click is live.
+
+## Flocking and patrol route (`SwarmConfig(flocking_config=...)`)
+
+`drone_swarm/flocking.py` gives drones with nothing else assigned (no mission zone, not investigating a disturbance) real, coordinated group movement — separation, alignment, and cohesion, the classic three-rule boid model — instead of each one drifting independently in its own straight line. `flock_velocity()` is a standalone steering function (a drone, its already-found neighbors, and an optional shared target point in, a new velocity out), kept deliberately decoupled from how neighbors get found (`Swarm._move` uses `spatial_grid.py`'s `SpatialGrid`, the same O(n) proximity structure `mesh_network.py` and `topology.py` already rely on) or *why* a drone is flocking.
+
+That "why" is `patrol.py`'s new patrol route: an elliptical ring of waypoints auto-generated inset from the arena edges — sized to whatever the arena's actual dimensions are, no per-mode tuning needed — that the entire idle population tours together as one flock, advancing to the next waypoint once the idle population's own *centroid* arrives (not any single drone, so a straggler at the back never yanks the target away from drones still converging). The result reads as "the swarm patrols the perimeter," built from two small, honestly-separate pieces rather than one bespoke patrol system.
+
+**Play with it live**: unlike every other `*Config` in this codebase, `FlockingConfig` is deliberately not frozen — a small panel in the top-right of Scale mode's demo exposes separation/alignment/cohesion/speed as sliders plus a patrol-route on/off toggle, all wired to a WebSocket control message that mutates the *running* swarm's config in place. No reset, no lost state — turn cohesion up and watch the flock visibly tighten in real time.
+
+Scale mode's arena was also widened (1400×900 → 2000×1280, comm_range nudged 180 → 210 to keep the mesh well-connected at the larger size) specifically so the flock and patrol route have real room to move rather than reading as crowded — verified live that nexus convergence and tick timing (~6ms/tick at 100 drones) are unaffected.
 
 ## Project structure
 
@@ -104,7 +114,8 @@ drone_swarm/
   swarm.py            # Swarm: owns drones, the mesh, and every drone's election state
   metrics.py          # recovery time, election/message counters — see Metrics below
   mission.py          # zone-coverage resource allocation — see Resource allocation below
-  patrol.py            # disturbance investigation — see Patrol and disturbance investigation above
+  patrol.py            # disturbance investigation + patrol route — see Patrol and disturbance investigation / Flocking above
+  flocking.py           # boid steering primitive — see Flocking and patrol route above
   command.py          # hierarchical platoon/commander election — see Hierarchical command above
   policy.py            # learned allocation policy (PyTorch) — a drop-in for mission.py's allocator
   train.py              # REINFORCE training + evaluation pipeline for policy.py
@@ -113,7 +124,7 @@ drone_swarm/
 antagonist/          # adversarial testing tool — see the BFT section below
 server.py            # FastAPI + WebSocket server for the live browser demo (Scale / Security modes)
 frontend/            # canvas visualization (vanilla HTML/CSS/JS, no build step)
-tests/                 # pytest suite covering topology, mesh, election, swarm, BFT, metrics, mission, policy, command, and patrol behavior
+tests/                 # pytest suite covering topology, mesh, election, swarm, BFT, metrics, mission, policy, command, patrol, and flocking behavior
 ```
 
 ## Running it
