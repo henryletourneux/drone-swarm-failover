@@ -13,6 +13,7 @@
   --down: #ff6b5e;
   --started: #f5c451;
   --won: #5fe38a;
+  --relief: #34d1c4;
   --mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", Consolas, "Liberation Mono", Menlo, monospace;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
@@ -219,6 +220,11 @@ canvas#swarm-canvas {
 .dot--relay { background: var(--relay); }
 .dot--leaf { background: var(--leaf); }
 .dot--dead { background: var(--dead); }
+.ring {
+  width: 9px; height: 9px; border-radius: 50%; display: inline-block;
+  border: 2px solid var(--leaf);
+}
+.ring--relief { border-color: var(--relief); }
 
 /* Log panel */
 .log-panel {
@@ -268,6 +274,8 @@ canvas#swarm-canvas {
 .ev--election_won .ev-detail { color: #86efac; }
 .ev--mission_assigned { border-left-color: var(--accent); }
 .ev--mission_assigned .ev-detail { color: #7dd3fc; }
+.ev--battery_substitution { border-left-color: var(--relief); }
+.ev--battery_substitution .ev-detail { color: #7de8de; }
 .ev--attack {
   border-left-color: #ff3b3b;
   background: rgba(255, 59, 59, 0.08);

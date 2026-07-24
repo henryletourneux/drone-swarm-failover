@@ -44,8 +44,22 @@ class SwarmMetrics:
     elections_won: int = 0
     merges: int = 0
 
+    # Hierarchical-command counters (drone_swarm/command.py) -- a
+    # separate distribution from recovery_times_s on purpose: mixing
+    # "time a drone had no known platoon nexus" with "time a platoon
+    # nexus had no known commander" into one figure would conflate two
+    # different, non-comparable quantities. Both default to inert/empty
+    # and only ever get populated when SwarmConfig.command_config is set.
+    commander_recovery_times_s: list = field(default_factory=list)
+    commander_elections_started: int = 0
+    commander_elections_won: int = 0
+    commander_merges: int = 0
+
     def record_recovery(self, duration_s: float) -> None:
         self.recovery_times_s.append(duration_s)
+
+    def record_commander_recovery(self, duration_s: float) -> None:
+        self.commander_recovery_times_s.append(duration_s)
 
     def snapshot(self, mesh, elections: dict) -> dict:
         rejected = sum(getattr(e, "rejected_message_count", 0) for e in elections.values())
@@ -57,5 +71,15 @@ class SwarmMetrics:
             "messages_sent": mesh.sent_count,
             "messages_delivered": mesh.delivered_count,
             "messages_dropped_loss": mesh.dropped_loss_count,
+            "security_rejections": rejected,
+        }
+
+    def commander_snapshot(self, commander_elections: dict) -> dict:
+        rejected = sum(getattr(e, "rejected_message_count", 0) for e in commander_elections.values())
+        return {
+            "recovery": _distribution(self.commander_recovery_times_s),
+            "elections_started": self.commander_elections_started,
+            "elections_won": self.commander_elections_won,
+            "merges": self.commander_merges,
             "security_rejections": rejected,
         }

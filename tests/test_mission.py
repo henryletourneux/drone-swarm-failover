@@ -6,7 +6,15 @@ heuristic allocator scoring/assignment), and end-to-end through Swarm
 zone -- not just the assignment decision, since a real bug during
 development was drones being assigned but never actually moving).
 """
-from drone_swarm.mission import HeuristicAllocator, MissionConfig, MissionState, Zone, ZoneStatus
+from drone_swarm.mission import (
+    LOW_BATTERY_WARNING,
+    MIN_BATTERY_TO_ASSIGN,
+    HeuristicAllocator,
+    MissionConfig,
+    MissionState,
+    Zone,
+    ZoneStatus,
+)
 from drone_swarm.model import Drone
 from drone_swarm.swarm import Swarm, SwarmConfig
 
@@ -89,6 +97,51 @@ def test_battery_drains_faster_in_undersupported_contested_zone():
 
     expected_drain = 0.1 + (1.0 * 2.0)  # base + contested*threat_level
     assert drone.battery == 100.0 - expected_drain
+
+
+def test_secured_occupancy_drain_defaults_to_zero_extra_cost():
+    """Regression test for a real bug found via a live-scenario smoke
+    test: an earlier attempt to make substitution demo-observable bumped
+    base_drain_per_tick instead (which applies to every drone forever,
+    with no recharge -- it nearly drained the entire live-demo fleet to
+    zero within a few real minutes regardless of what any drone was
+    doing, and zero zones ever finished securing). This field exists
+    specifically so that lever only touches drones actively holding an
+    already-secured zone, and it must default to inert."""
+    zone = Zone(id="Z", x=0, y=0, radius=10, required_drones=1)
+    mission = MissionState(MissionConfig(zones=(zone,), base_drain_per_tick=0.0))
+    drone = Drone(id="A", x=0, y=0, priority=1, battery=100.0)
+    drones = {"A": drone}
+
+    mission._occupants_of(drones)
+    assert mission.zone_statuses["Z"].secured is True
+    mission._drain_batteries(drones)
+    assert drone.battery == 100.0  # secured, and secured_occupancy_drain_per_tick defaults to 0.0
+
+
+def test_secured_occupancy_drain_applies_only_to_secured_occupants():
+    secured_zone = Zone(id="S", x=0, y=0, radius=10, required_drones=1)
+    unsecured_zone = Zone(id="U", x=1000, y=1000, radius=10, required_drones=5)  # can't be secured by 1 drone
+    config = MissionConfig(
+        zones=(secured_zone, unsecured_zone),
+        base_drain_per_tick=0.0,
+        contested_drain_per_tick=0.0,
+        secured_occupancy_drain_per_tick=0.2,
+    )
+    mission = MissionState(config)
+    secured_occupant = Drone(id="A", x=0, y=0, priority=1, battery=100.0)
+    unsecured_occupant = Drone(id="B", x=1000, y=1000, priority=1, battery=100.0)
+    idle_drone = Drone(id="C", x=500, y=500, priority=1, battery=100.0)
+    drones = {"A": secured_occupant, "B": unsecured_occupant, "C": idle_drone}
+
+    mission._occupants_of(drones)
+    assert mission.zone_statuses["S"].secured is True
+    assert mission.zone_statuses["U"].secured is False
+    mission._drain_batteries(drones)
+
+    assert secured_occupant.battery == 99.8  # 100 - secured_occupancy_drain_per_tick
+    assert unsecured_occupant.battery == 100.0  # unsecured -- contested drain, not secured drain, and that's 0 here
+    assert idle_drone.battery == 100.0  # not an occupant of anything
 
 
 def test_battery_floor_at_zero():
@@ -243,3 +296,171 @@ def test_low_battery_drone_loses_its_assignment():
     drone.battery = 5.0  # below MIN_BATTERY_TO_ASSIGN, and not actually in the zone
     swarm.tick()
     assert drone.mission_zone_id is None
+
+
+# -- Battery substitution / reserve pool ---------------------------------------
+
+def test_plan_substitutions_dispatches_reserve_to_relieve_draining_occupant():
+    zone = Zone(id="Z", x=0, y=0, radius=10, required_drones=1)
+    status = ZoneStatus(zone=zone, occupant_ids=["tired"], secured=True)
+    allocator = HeuristicAllocator()
+
+    tired = Drone(id="tired", x=0, y=0, priority=1, battery=LOW_BATTERY_WARNING - 1.0)
+    reserve = Drone(id="reserve", x=5, y=0, priority=1, battery=100.0)
+    drones = {"tired": tired, "reserve": reserve}
+
+    assignments = allocator.plan_substitutions(drones, [status], arena_diagonal=1000.0)
+    assert assignments == {"reserve": "Z"}
+
+
+def test_plan_substitutions_prioritizes_most_urgent_zone_first():
+    """The 'AI prioritizes which zones get priority substitution' part:
+    with only one reserve drone available and two zones both needing
+    relief, the more urgent one (lower remaining battery) wins."""
+    urgent = ZoneStatus(zone=Zone(id="urgent", x=0, y=0, radius=10, required_drones=1), occupant_ids=["low"], secured=True)
+    less_urgent = ZoneStatus(zone=Zone(id="less", x=0, y=0, radius=10, required_drones=1), occupant_ids=["mid"], secured=True)
+    allocator = HeuristicAllocator()
+
+    low_battery_occupant = Drone(id="low", x=0, y=0, priority=1, battery=5.0)
+    mid_battery_occupant = Drone(id="mid", x=0, y=0, priority=1, battery=LOW_BATTERY_WARNING - 1.0)
+    reserve = Drone(id="reserve", x=0, y=0, priority=1, battery=100.0)
+    drones = {"low": low_battery_occupant, "mid": mid_battery_occupant, "reserve": reserve}
+
+    assignments = allocator.plan_substitutions(drones, [urgent, less_urgent], arena_diagonal=1000.0)
+    assert assignments == {"reserve": "urgent"}
+
+
+def test_plan_substitutions_only_pulls_from_idle_healthy_reserve():
+    """Committed drones (busy elsewhere) and drones too low on battery to
+    be reserve material themselves are never poached for a substitution."""
+    zone = Zone(id="Z", x=0, y=0, radius=10, required_drones=1)
+    status = ZoneStatus(zone=zone, occupant_ids=["tired"], secured=True)
+    allocator = HeuristicAllocator()
+
+    tired = Drone(id="tired", x=0, y=0, priority=1, battery=10.0)
+    already_assigned = Drone(id="assigned", x=0, y=0, priority=1, battery=100.0, mission_zone_id="other")
+    low_battery_reserve = Drone(id="low_reserve", x=0, y=0, priority=1, battery=40.0)  # below the 50% reserve floor
+    drones = {"tired": tired, "assigned": already_assigned, "low_reserve": low_battery_reserve}
+
+    assignments = allocator.plan_substitutions(drones, [status], arena_diagonal=1000.0)
+    assert assignments == {}
+
+
+def test_plan_substitutions_ignores_zones_that_are_not_secured_or_not_draining():
+    allocator = HeuristicAllocator()
+    reserve = Drone(id="reserve", x=0, y=0, priority=1, battery=100.0)
+
+    unsecured = ZoneStatus(zone=Zone(id="unsecured", x=0, y=0, radius=10, required_drones=2), occupant_ids=["a"], secured=False)
+    healthy = ZoneStatus(zone=Zone(id="healthy", x=0, y=0, radius=10, required_drones=1), occupant_ids=["b"], secured=True)
+    drones = {
+        "a": Drone(id="a", x=0, y=0, priority=1, battery=5.0),  # low battery, but zone isn't secured
+        "b": Drone(id="b", x=0, y=0, priority=1, battery=90.0),  # secured, but not draining
+        "reserve": reserve,
+    }
+
+    assignments = allocator.plan_substitutions(drones, [unsecured, healthy], arena_diagonal=1000.0)
+    assert assignments == {}
+
+
+def test_release_relieved_occupants_only_after_replacement_physically_arrives():
+    zone = Zone(id="Z", x=0, y=0, radius=10, required_drones=1)
+    mission = MissionState(MissionConfig(zones=(zone,)))
+
+    tired = Drone(id="tired", x=0, y=0, priority=1, battery=10.0, mission_zone_id="Z")
+    drones = {"tired": tired}
+    mission._occupants_of(drones)
+    mission._release_relieved_occupants(drones)
+    # Alone in the zone and still needed -- held despite very low battery,
+    # exactly like before this feature existed, since no relief has arrived.
+    assert tired.mission_zone_id == "Z"
+    assert mission.zone_statuses["Z"].occupant_ids == ["tired"]
+
+    fresh = Drone(id="fresh", x=1, y=0, priority=1, battery=100.0, mission_zone_id="Z")
+    drones["fresh"] = fresh
+    mission._occupants_of(drones)  # both now physically present -- surplus of 1
+    mission._release_relieved_occupants(drones)
+    assert tired.mission_zone_id is None
+    assert mission.zone_statuses["Z"].occupant_ids == ["fresh"]
+    assert mission.zone_statuses["Z"].secured is True
+
+
+def test_stale_assignment_released_once_zone_secured_without_it():
+    """Regression test for a real bug found via a live-scenario smoke test:
+    a drone inbound to a zone that gets secured by OTHER, physically-closer
+    drones before it arrives never becomes an occupant (so the 'arrived,
+    still holding' path never fires) and might never drop low enough on
+    battery to lose eligibility either -- so it kept mission_zone_id set
+    forever, permanently unavailable as substitution reserve capacity for
+    any other zone. It should be released as soon as its target zone is
+    secured without it."""
+    zone = Zone(id="Z", x=0, y=0, radius=10, required_drones=1)
+    mission = MissionState(MissionConfig(zones=(zone,)))
+
+    already_secured_it = Drone(id="occupant", x=0, y=0, priority=1, battery=90.0, mission_zone_id="Z")
+    still_inbound = Drone(id="inbound", x=500, y=500, priority=1, battery=90.0, mission_zone_id="Z")
+    drones = {"occupant": already_secured_it, "inbound": still_inbound}
+
+    mission._occupants_of(drones)
+    assert mission.zone_statuses["Z"].secured is True
+
+    class _FakeSwarm:
+        pass
+    fake_swarm = _FakeSwarm()
+    fake_swarm.drones = drones
+    fake_swarm.width, fake_swarm.height = 1000.0, 1000.0
+
+    mission.tick(fake_swarm)
+    assert still_inbound.mission_zone_id is None
+    assert already_secured_it.mission_zone_id == "Z"  # the actual occupant keeps holding
+
+
+def test_inbound_substitute_not_released_before_it_arrives():
+    """Regression test for a real bug found via a live-scenario smoke test:
+    a substitution target is by definition an already-secured (but
+    draining) zone -- exactly the state the stale-assignment release
+    above (test_stale_assignment_released_once_zone_secured_without_it)
+    is looking for. Without distinguishing "secured because someone else
+    already has it covered" from "secured but the occupant needs relief",
+    a freshly-dispatched substitute got released the very next tick,
+    before it could ever physically arrive, then immediately redispatched
+    -- an infinite same-tick substitution-event loop that never actually
+    delivered relief."""
+    zone = Zone(id="Z", x=0, y=0, radius=10, required_drones=1)
+    mission = MissionState(MissionConfig(zones=(zone,)))
+
+    tired_occupant = Drone(id="tired", x=0, y=0, priority=1, battery=LOW_BATTERY_WARNING - 1.0, mission_zone_id="Z")
+    inbound_substitute = Drone(id="incoming", x=500, y=500, priority=1, battery=90.0, mission_zone_id="Z")
+    drones = {"tired": tired_occupant, "incoming": inbound_substitute}
+
+    mission._occupants_of(drones)
+    assert mission.zone_statuses["Z"].secured is True  # tired alone already meets required_drones=1
+
+    class _FakeSwarm:
+        pass
+    fake_swarm = _FakeSwarm()
+    fake_swarm.drones = drones
+    fake_swarm.width, fake_swarm.height = 1000.0, 1000.0
+
+    mission.tick(fake_swarm)
+    assert inbound_substitute.mission_zone_id == "Z"  # still en route, not released
+    assert tired_occupant.mission_zone_id == "Z"  # still holding, hasn't been relieved yet
+
+
+def test_battery_substitution_event_fires_without_waiting_for_periodic_reallocation():
+    """Regression proof that substitution is the fast reactive layer: it
+    must dispatch relief long before the coarse reallocation_interval_ticks
+    cadence would otherwise get around to it."""
+    zone = Zone(id="Z", x=0, y=0, radius=5, required_drones=1)
+    config = SwarmConfig(
+        nexus_heartbeat_interval_s=0.3, nexus_timeout_s=0.8, comm_latency_s=0.05,
+        tick_dt_s=0.2, packet_loss_rate=0.0,
+        mission_config=MissionConfig(zones=(zone,), reallocation_interval_ticks=1000),
+    )
+    occupant = Drone(id="occupant", x=0, y=0, priority=10, battery=LOW_BATTERY_WARNING - 1.0)
+    reserve = Drone(id="reserve", x=200, y=200, priority=11, battery=100.0)
+    swarm = Swarm([occupant, reserve], comm_range=500, config=config, seed=1)
+
+    _tick(swarm, 20)
+
+    assert any(e["type"] == "battery_substitution" for e in swarm.event_log)
+    assert reserve.mission_zone_id == "Z"

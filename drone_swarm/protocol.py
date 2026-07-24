@@ -31,6 +31,15 @@ class NexusHeartbeat(Message):
     # A bundle of the ElectionMessages that legitimately elected this
     # nexus for this term -- required to trust the term claim in BFT mode.
     quorum_certificate: tuple = field(default_factory=tuple)
+    # Which election this belongs to -- "flat" (default, the only value
+    # that ever existed before hierarchical command) for a normal
+    # swarm-wide election, "platoon:<id>" or "commander" when
+    # SwarmConfig.command_config is set (see command.py). A single
+    # NexusElection instance only ever reacts to messages carrying its
+    # own layer, so two independent elections (e.g. a platoon's own nexus
+    # election and the commander election among platoon nexuses) can run
+    # over the same mesh without cross-contaminating each other.
+    layer: str = "flat"
 
 
 @dataclass(frozen=True)
@@ -42,11 +51,12 @@ class ElectionMessage(Message):
     priority: float
     signature: bytes = None
     credential: object = None  # identity.Credential, when bft_mode is on
+    layer: str = "flat"  # see NexusHeartbeat.layer
 
 
-def election_message_payload(sender_id: str, sent_at_s: float, term: int, priority: float) -> bytes:
-    return f"election:{sender_id}:{sent_at_s}:{term}:{priority}".encode()
+def election_message_payload(sender_id: str, sent_at_s: float, term: int, priority: float, layer: str = "flat") -> bytes:
+    return f"election:{sender_id}:{sent_at_s}:{term}:{priority}:{layer}".encode()
 
 
-def heartbeat_payload(sender_id: str, sent_at_s: float, term: int) -> bytes:
-    return f"heartbeat:{sender_id}:{sent_at_s}:{term}".encode()
+def heartbeat_payload(sender_id: str, sent_at_s: float, term: int, layer: str = "flat") -> bytes:
+    return f"heartbeat:{sender_id}:{sent_at_s}:{term}:{layer}".encode()

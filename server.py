@@ -37,6 +37,17 @@ SCALE_MISSION = MissionConfig(
         Zone(id="Z3", x=700, y=450, radius=80, required_drones=10, threat_level=0.5),
     ),
     reallocation_interval_ticks=10,
+    # base_drain_per_tick's default (0.01) applies to EVERY drone
+    # unconditionally forever, with no recharge mechanic -- bumping it
+    # broadly was tried first and nearly broke the whole demo (verified
+    # live: the entire 100-drone fleet drained to empty within ~5 real
+    # minutes regardless of what any drone was doing, so zones never even
+    # finished securing). secured_occupancy_drain_per_tick is a separate,
+    # targeted knob that only speeds up drones actively holding an
+    # already-secured zone, so idle/reserve/en-route drones keep the safe
+    # default lifespan while a relief dispatch still becomes observable
+    # within roughly 2-3 real minutes of a zone locking in "secured".
+    secured_occupancy_drain_per_tick=0.17,
 )
 
 # Two distinct live-demo modes, not one compromise config. Profiling found a

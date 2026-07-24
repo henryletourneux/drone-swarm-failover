@@ -25,7 +25,7 @@ import math
 import torch
 from torch import nn
 
-from .mission import MIN_BATTERY_TO_ASSIGN
+from .mission import LOW_BATTERY_WARNING, MIN_BATTERY_TO_ASSIGN, RESERVE_BATTERY_FRACTION
 
 FEATURE_NAMES = (
     "battery_frac", "distance_frac", "threat_frac", "need_frac",
@@ -145,6 +145,42 @@ class LearnedAllocator:
                     remaining_need[zone.id] -= 1
                 # else: policy chose "stay idle" for this drone
 
+        return assignments
+
+    def plan_substitutions(self, drones: dict, zone_statuses: list, arena_diagonal: float) -> dict:
+        """Same battery-substitution contract as
+        HeuristicAllocator.plan_substitutions (drone_swarm/mission.py):
+        dispatches reserve drones to relieve draining occupants, using
+        the trained network's scoring in place of the hand-tuned
+        heuristic weights. Always greedy (no exploration/log-prob
+        tracking) -- substitution is a fast reactive safety layer, not
+        part of the RL training signal, so it runs the same way whether
+        `sample` is True or False."""
+        committed = {d_id for s in zone_statuses for d_id in s.occupant_ids}
+        reserve = [
+            d for d in drones.values()
+            if d.alive and d.id not in committed and d.mission_zone_id is None
+            and d.battery >= 100.0 * RESERVE_BATTERY_FRACTION
+        ]
+        needing_relief = sorted(
+            (
+                s for s in zone_statuses
+                if s.secured and any(drones[d_id].battery < LOW_BATTERY_WARNING for d_id in s.occupant_ids)
+            ),
+            key=lambda s: (min(drones[d_id].battery for d_id in s.occupant_ids), -s.zone.threat_level),
+        )
+
+        assignments: dict = {}
+        with torch.no_grad():
+            for status in needing_relief:
+                if not reserve:
+                    break
+                features = [drone_zone_features(d, status, arena_diagonal) for d in reserve]
+                x = torch.tensor(features, dtype=torch.float32)
+                scores = self.policy(x)
+                best = reserve[int(torch.argmax(scores).item())]
+                assignments[best.id] = status.zone.id
+                reserve.remove(best)
         return assignments
 
 

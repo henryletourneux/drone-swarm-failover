@@ -109,6 +109,7 @@ class NexusElection:
         credential=None,
         registry=None,
         total_swarm_size: int = 1,
+        layer: str = "flat",
     ) -> None:
         self._heartbeat_interval_s = nexus_heartbeat_interval_s
         self._timeout_s = nexus_timeout_s
@@ -123,6 +124,10 @@ class NexusElection:
         self._credential = credential  # this drone's authority-signed Credential
         self._registry = registry  # IdentityRegistry, shared read-only across the swarm
         self._total_swarm_size = total_swarm_size
+        # Which election this instance belongs to -- see
+        # protocol.py's NexusHeartbeat.layer docstring. "flat" (default)
+        # means every existing test/config is completely unaffected.
+        self._layer = layer
         self._quorum_certificate: tuple = ()
         # bft_mode only: how many incoming messages this drone has dropped
         # for failing signature/credential/quorum verification. Public
@@ -157,7 +162,12 @@ class NexusElection:
             return True
         if msg.signature is None or msg.credential is None:
             return False
-        payload = election_message_payload(msg.sender_id, msg.sent_at_s, msg.term, msg.priority)
+        # Built from msg's own CLAIMED layer, not self._layer -- this is
+        # what makes relabeling a message from one layer to another
+        # cryptographically impossible rather than just filtered by
+        # convention: a signature genuinely computed over layer="platoon:P1"
+        # will not verify against a payload rebuilt with layer="commander".
+        payload = election_message_payload(msg.sender_id, msg.sent_at_s, msg.term, msg.priority, msg.layer)
         if not self._registry.verify_signature(msg.sender_id, payload, msg.signature):
             return False
         credential = msg.credential
@@ -170,7 +180,7 @@ class NexusElection:
             return True
         if msg.signature is None:
             return False
-        payload = heartbeat_payload(msg.sender_id, msg.sent_at_s, msg.term)
+        payload = heartbeat_payload(msg.sender_id, msg.sent_at_s, msg.term, msg.layer)
         if not self._registry.verify_signature(msg.sender_id, payload, msg.signature):
             return False
 
@@ -187,6 +197,14 @@ class NexusElection:
             if not isinstance(candidacy, ElectionMessage):
                 continue
             if candidacy.term != msg.term or candidacy.sender_id == msg.sender_id:
+                continue
+            if candidacy.layer != msg.layer:
+                # Without this check, a genuinely-signed candidacy from a
+                # DIFFERENT election (e.g. real platoon-layer traffic
+                # sniffed off the mesh) could be bundled into a forged
+                # heartbeat for THIS layer and still pass -- each
+                # candidacy verifies fine on its own terms, but proves
+                # nothing about quorum for a term jump on this election.
                 continue
             if not self._verify_election_message(candidacy):
                 continue  # doesn't count toward quorum -- couldn't be verified
@@ -205,6 +223,8 @@ class NexusElection:
         for msg in incoming:
             if not isinstance(msg, NexusHeartbeat) or msg.sender_id == self_id:
                 continue
+            if msg.layer != self._layer:
+                continue  # a different election entirely -- not for us
             if not self._verify_heartbeat(msg):
                 self.rejected_message_count += 1
                 continue  # unsigned, forged, or an unproven term jump -- dropped
@@ -226,6 +246,8 @@ class NexusElection:
         for msg in incoming:
             if not isinstance(msg, ElectionMessage) or msg.sender_id == self_id:
                 continue
+            if msg.layer != self._layer:
+                continue  # a different election entirely -- not for us
             if not self._verify_election_message(msg):
                 self.rejected_message_count += 1
                 continue  # unsigned, forged, or an uncertified priority claim -- dropped
@@ -319,13 +341,14 @@ class NexusElection:
     def _emit_heartbeat(self, now_s: float, self_id: str, outgoing: list) -> None:
         signature = None
         if self._bft_mode:
-            signature = self._identity.sign(heartbeat_payload(self_id, now_s, self.term))
+            signature = self._identity.sign(heartbeat_payload(self_id, now_s, self.term, self._layer))
         outgoing.append(NexusHeartbeat(
             sender_id=self_id,
             sent_at_s=now_s,
             term=self.term,
             signature=signature,
             quorum_certificate=self._quorum_certificate,
+            layer=self._layer,
         ))
         self._last_heartbeat_emitted_s = now_s
         self._last_nexus_contact_s = now_s
@@ -335,7 +358,7 @@ class NexusElection:
     def _make_election_message(self, self_id: str, now_s: float, term: int, self_priority: float) -> ElectionMessage:
         signature = None
         if self._bft_mode:
-            signature = self._identity.sign(election_message_payload(self_id, now_s, term, self_priority))
+            signature = self._identity.sign(election_message_payload(self_id, now_s, term, self_priority, self._layer))
         return ElectionMessage(
             sender_id=self_id,
             sent_at_s=now_s,
@@ -343,4 +366,5 @@ class NexusElection:
             priority=self_priority,
             signature=signature,
             credential=self._credential,
+            layer=self._layer,
         )

@@ -66,6 +66,18 @@ Drones aren't pinned in place — each one drifts at a constant velocity and bou
 
 The mesh's actual geometric adjacency (`build_adjacency`/`connected_components`/`bfs_reachable` in `drone_swarm/topology.py`, written from scratch, no graph library) is kept separate from message delivery — it's used purely to draw the right edges in the visualization and to classify each drone's on-screen role (relay vs. leaf), not for election correctness. A drone can be geometrically "in range" of another without their messages having actually gotten through yet, or at all.
 
+## Hierarchical command (`SwarmConfig(command_config=...)`)
+
+`drone_swarm/command.py` groups drones into static, config-assigned **platoons**, each independently running the exact same election engine as a flat swarm to pick its own nexus — and then a *second*, independent election runs among whichever drones currently hold a platoon-nexus seat, to pick an overall commander. Same mechanism, applied recursively, not a second algorithm: `NexusElection` was already fully generic over `(id, priority, incoming messages)`, so a second instance is enough.
+
+Both tiers run over the exact same mesh — there's no separate long-range radio channel, and none is needed: `MeshNetwork` already relays any message through any alive drone regardless of role, so commander-layer traffic between physically-scattered platoon nexuses is carried by ordinary platoon members acting as relays, for free. What keeps the two elections from cross-contaminating on the wire is a `layer` field on every message (`"platoon:<id>"` or `"commander"`) that each `NexusElection` instance only ever reacts to its own value of — and, in `bft_mode`, that field is folded into the signed payload, so relabeling a genuinely-signed message from one layer to the other fails verification rather than just being filtered by convention.
+
+**A real BFT gap found while building this, worth naming**: the quorum-certificate check that guards large term jumps originally verified each bundled candidacy on its own terms, but never checked that a candidacy's layer matched the heartbeat it was bundled into. That meant a genuinely-signed *platoon*-layer candidacy, sniffed straight off the mesh, could be bundled into a forged *commander*-layer heartbeat and still count toward its quorum. Fixed, with a regression test (`test_bft_quorum_certificate_rejects_wrong_layer_candidacies`) that reintroduces the exact gap and confirms it would have been caught.
+
+**Dynamic membership, the genuinely hard part**: a platoon's nexus seat can change hands at any time (ordinary failover), so the set of drones running a commander election is rebuilt every tick rather than fixed at startup like every other engine in this codebase. Losing a seat mid-campaign is never special-cased — it's made to look, from every other commander-layer engine's point of view, exactly like that participant going silent, which the underlying Bully+recency mechanism already handles correctly (verified live: killing the sitting commander in a 4-platoon, 24-drone swarm converges on a new one within the normal timeout window, no special-cased recovery code required).
+
+**Honest limitation, stated plainly**: if the current platoon-nexus subgraph isn't fully reachable within `max_relay_hops` — dispersed platoons, a small `comm_range`, or a real partition — no single commander converges; each mutually-reachable cluster elects its own, exactly mirroring the flat layer's own already-tested multi-nexus-under-partition behavior. That's why `commander_ids()` returns a list, not a single id.
+
 ## Project structure
 
 ```
@@ -137,6 +149,14 @@ Allocation decisions are made by whichever drone is currently the elected nexus,
 **Honest simplification, stated plainly:** allocation currently runs with full, instantaneous knowledge of every drone's position and battery — an omniscient call made by the simulation (mirroring how role assignment already works), not routed through the mesh's own realistic, partial-information message-passing the way election is. That's a deliberate scope cut for this phase, and a natural next refinement — real uncertainty about drone state is exactly the kind of problem a learned policy would have a genuine reason to exist for, rather than just re-deriving the same heuristic weights.
 
 It's live in Scale mode's demo (three zones of varying threat) — watch drones peel off, travel, and hold position as zones fill and lock in `secured`.
+
+### Battery substitution / reserve pool
+
+Once a zone is secured, its occupants can still keep draining indefinitely — the periodic `HeuristicAllocator.allocate()` pass above only runs every `reallocation_interval_ticks` and only fills *unsecured* zones, so a low-battery drone quietly holding a secured zone had no path to relief. `HeuristicAllocator.plan_substitutions()` is a second, faster layer that runs every tick: once a secured zone's occupant drops below `LOW_BATTERY_WARNING` (35, above the 20 that would make it ineligible outright), it dispatches the best-scoring idle, healthy drone as an incoming replacement — and, when several zones need relief at once, prioritizes the most urgent (lowest battery, then highest threat) first. The tired occupant isn't released the instant a replacement is *dispatched* — only once it's actually *arrived* (an explicit "surplus" check), so the zone is never under-secured mid-handoff. `LearnedAllocator` implements the same `plan_substitutions()` contract using the trained network's scoring instead of hand-tuned weights, so it stays a genuine drop-in either way.
+
+There's no battery-recharge mechanic in this simulation — "reserve pool" means healthy, currently-uncommitted drones, not a charging station.
+
+Building this against a real running swarm (not just unit tests) surfaced a real bug worth naming: a drone en route to a zone that got secured by *other*, physically-closer drones before it arrived would never become an occupant and never drain low enough to lose its assignment either — so it carried a dead `mission_zone_id` forever, permanently unavailable as reserve capacity. Fixing that then created a second, sneakier one: since a substitution's whole point is dispatching a drone toward an *already-secured* zone, the same "release it, it's not needed" check immediately fired on the drone substitution had just sent — releasing it before it could ever arrive, then redispatching it the very next tick, forever. Both are covered by regression tests (`test_stale_assignment_released_once_zone_secured_without_it`, `test_inbound_substitute_not_released_before_it_arrives`) that reintroduce each bug independently and confirm the tests actually catch it.
 
 ### A learned allocation policy
 

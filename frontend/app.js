@@ -25,6 +25,7 @@ const modeScaleBtn = document.getElementById("mode-scale-btn");
 const modeSecurityBtn = document.getElementById("mode-security-btn");
 const connEl = document.getElementById("conn-indicator");
 const connLabel = document.getElementById("conn-label");
+const legendBattery = document.getElementById("legend-battery");
 
 const stat = {
   recoveryMean: document.getElementById("stat-recovery-mean"),
@@ -56,6 +57,16 @@ const ATTACK_PROJECTILE_MS = 550;
 const ATTACK_FLASH_MS = 1300;
 let activeAttackProjectile = null; // {droneId, startTime, angle}
 let activeAttackFlash = null; // {droneId, startTime}
+
+// Battery-substitution "relief" beacons (drone_swarm/mission.py's
+// plan_substitutions): a dispatched reserve drone gets a pulsing marker and
+// a dashed line to the zone it's heading to relieve, so the swap reads as an
+// event happening in the arena, not just a log line. Matches
+// LOW_BATTERY_WARNING in mission.py -- keep in sync if that changes.
+const LOW_BATTERY_WARNING = 35;
+const MIN_BATTERY_TO_ASSIGN = 20;
+const RELIEF_BEACON_MS = 1800;
+let activeReliefBeacons = []; // [{droneId, zoneId, startTime}]
 
 // --- Position interpolation --------------------------------------------------
 //
@@ -202,6 +213,46 @@ function draw() {
       if (target) drawAttackFlash(target, t);
     }
   }
+
+  // Battery-substitution relief beacons: a dashed line from the dispatched
+  // reserve drone to the zone it's heading to relieve, fading out once the
+  // dispatch has had a moment to register visually.
+  if (activeReliefBeacons.length) {
+    const zonesById = {};
+    if (state.mission) for (const z of state.mission.zones) zonesById[z.id] = z;
+    activeReliefBeacons = activeReliefBeacons.filter((beacon) => {
+      const elapsed = performance.now() - beacon.startTime;
+      if (elapsed > RELIEF_BEACON_MS) return false;
+      const drone = byId[beacon.droneId];
+      const zone = zonesById[beacon.zoneId];
+      if (drone && zone) drawReliefBeacon(drone, zone, elapsed / RELIEF_BEACON_MS);
+      return true;
+    });
+  }
+}
+
+function drawReliefBeacon(drone, zone, t) {
+  const dp = worldToScreen(drone.x, drone.y);
+  const zp = worldToScreen(zone.x, zone.y);
+  const alpha = 1 - t;
+
+  ctx.save();
+  ctx.setLineDash([5, 4]);
+  ctx.strokeStyle = `rgba(52, 209, 196, ${alpha * 0.8})`;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(dp.x, dp.y);
+  ctx.lineTo(zp.x, zp.y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const pulse = 10 + t * 22;
+  ctx.strokeStyle = `rgba(52, 209, 196, ${alpha * 0.9})`;
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(dp.x, dp.y, pulse, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
 }
 
 function drawAttackVignette(rect, alpha) {
@@ -346,7 +397,36 @@ function drawDrone(d) {
   ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
   ctx.stroke();
 
+  if (state.mission && typeof d.battery === "number") drawBatteryGauge(d, p, r);
+
   drawLabel(d, p, r, false);
+}
+
+// A thin arc sweeping proportional to remaining battery, drawn as a ring
+// just outside the drone's role circle -- so a battery-substitution
+// dispatch (see drawReliefBeacon) reads as "this specific drone was
+// visibly draining" rather than appearing out of nowhere. Only drawn in
+// mission mode, since battery is otherwise inert (drone_swarm/mission.py).
+function drawBatteryGauge(d, p, r) {
+  const frac = Math.max(0, Math.min(1, d.battery / 100));
+  const color = d.battery < MIN_BATTERY_TO_ASSIGN ? "255, 107, 94" : d.battery < LOW_BATTERY_WARNING ? "245, 196, 81" : "110, 231, 183";
+  const gaugeR = r + 5;
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, gaugeR, 0, Math.PI * 2);
+  ctx.stroke();
+
+  if (frac > 0) {
+    ctx.strokeStyle = `rgba(${color}, 0.95)`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, gaugeR, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function drawLabel(d, p, r, dead) {
@@ -427,6 +507,7 @@ function renderModeUI() {
   modeScaleBtn.classList.toggle("mode-btn--active", state.mode === "scale");
   modeSecurityBtn.classList.toggle("mode-btn--active", state.mode === "security");
   attackBtn.style.display = state.mode === "security" ? "" : "none";
+  legendBattery.style.display = state.mission ? "" : "none";
 }
 
 // --- Event log --------------------------------------------------------------
@@ -438,6 +519,7 @@ const EV_LABEL = {
   swarms_merged: "MERGE",
   attack: "ATTACK",
   mission_assigned: "MISSION",
+  battery_substitution: "RELIEF",
 };
 
 const MAX_LOG_ROWS = 18;
@@ -463,6 +545,10 @@ function renderLog() {
 
     if (ev.type === "attack" && ev.drone) {
       activeAttackProjectile = { droneId: ev.drone, startTime: performance.now(), angle: Math.random() * Math.PI * 2 };
+    }
+
+    if (ev.type === "battery_substitution" && ev.drone && ev.zone) {
+      activeReliefBeacons.push({ droneId: ev.drone, zoneId: ev.zone, startTime: performance.now() });
     }
 
     if (emptyPlaceholder) emptyPlaceholder.remove();

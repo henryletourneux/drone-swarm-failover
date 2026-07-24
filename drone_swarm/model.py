@@ -40,6 +40,17 @@ class Drone:
     battery: float = 100.0
     mission_zone_id: str | None = None
 
+    # Hierarchical-command fields (drone_swarm/command.py) -- inert unless
+    # SwarmConfig.command_config is supplied, so every hand-built Drone()
+    # in existing tests is unaffected. platoon_id is static, set once at
+    # swarm construction. commander_id is this drone's OWN belief about
+    # who the commander is, populated only while it holds a commander
+    # election engine (i.e. while it's currently its platoon's nexus) --
+    # deliberately not propagated down to ordinary platoon members, since
+    # there's no message type carrying that information to them.
+    platoon_id: str | None = None
+    commander_id: str | None = None
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -51,4 +62,6 @@ class Drone:
             "role": self.role,
             "battery": round(self.battery, 1),
             "mission_zone_id": self.mission_zone_id,
+            "platoon_id": self.platoon_id,
+            "commander_id": self.commander_id,
         }

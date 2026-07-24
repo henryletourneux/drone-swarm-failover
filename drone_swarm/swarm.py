@@ -4,6 +4,7 @@ import math
 import random
 from dataclasses import dataclass
 
+from .command import CommandState
 from .election import ElectionRole, NexusElection
 from .identity import DroneIdentity, IdentityRegistry, SwarmAuthority
 from .mesh_network import MeshNetwork
@@ -12,6 +13,20 @@ from .mission import MissionState
 from .topology import build_adjacency
 
 MAX_EVENT_LOG = 200
+
+
+def _transition_kind(prev_role: ElectionRole, new_role: ElectionRole) -> str | None:
+    """Classifies a role change shared by both the flat/platoon layer
+    (_log_transition) and the commander layer (_log_commander_transition)
+    -- same election mechanic, same three transitions worth narrating,
+    at either tier."""
+    if prev_role != ElectionRole.CANDIDATE and new_role == ElectionRole.CANDIDATE:
+        return "started"
+    if prev_role == ElectionRole.CANDIDATE and new_role == ElectionRole.NEXUS:
+        return "won"
+    if prev_role == ElectionRole.NEXUS and new_role == ElectionRole.FOLLOWER:
+        return "merged"
+    return None
 
 
 @dataclass(frozen=True)
@@ -33,6 +48,13 @@ class SwarmConfig:
     mission.py) — None (default) means the mission system is entirely
     inert, same principle as bft_mode: an additive layer, off by default,
     zero effect on the base election/mesh tests without it.
+
+    `command_config` turns on hierarchical command (see command.py):
+    drones are grouped into platoons, each electing its own nexus, with
+    a second election among the current platoon nexuses picking an
+    overall commander — the same principle again, None (default) means
+    every drone runs a single flat, swarm-wide election exactly as
+    before, zero effect on the base tests without it.
     """
 
     max_relay_hops: int = 4
@@ -43,6 +65,7 @@ class SwarmConfig:
     tick_dt_s: float = 0.4
     bft_mode: bool = False
     mission_config: object = None
+    command_config: object = None
 
 
 class Swarm:
@@ -102,18 +125,40 @@ class Swarm:
                 self.credentials[d.id] = self.authority.issue_credential(d.id, d.priority)
                 self.registry.register(d.id, identity.public_key)
 
-        self.elections = {
-            d.id: NexusElection(
-                nexus_heartbeat_interval_s=self.config.nexus_heartbeat_interval_s,
-                nexus_timeout_s=self.config.nexus_timeout_s,
-                bft_mode=self.config.bft_mode,
-                identity=self.identities.get(d.id),
-                credential=self.credentials.get(d.id),
-                registry=self.registry,
-                total_swarm_size=len(drones),
+        # command_config replaces the flat, swarm-wide election below with
+        # one scoped to each drone's own platoon (same NexusElection
+        # class, different layer/total_swarm_size -- see command.py).
+        # Either way self.elections ends up {drone_id: NexusElection},
+        # one per drone, and the rest of tick() doesn't need to know
+        # which mode it's in.
+        self.command = CommandState(self.config.command_config, self.drones) if self.config.command_config is not None else None
+        election_kwargs = dict(
+            nexus_heartbeat_interval_s=self.config.nexus_heartbeat_interval_s,
+            nexus_timeout_s=self.config.nexus_timeout_s,
+            bft_mode=self.config.bft_mode,
+        )
+        if self.command is not None:
+            self.elections = self.command.build_platoon_elections(
+                self.drones, self.identities, self.credentials, self.registry, election_kwargs,
             )
-            for d in drones
-        }
+        else:
+            self.elections = {
+                d.id: NexusElection(
+                    **election_kwargs,
+                    identity=self.identities.get(d.id),
+                    credential=self.credentials.get(d.id),
+                    registry=self.registry,
+                    total_swarm_size=len(drones),
+                )
+                for d in drones
+            }
+        # Always initialized, whether or not command_config is set, so
+        # tick() never needs a None-check to decide whether to touch
+        # them -- empty/unused in flat mode, same idiom as
+        # self.identities/self.credentials above.
+        self.commander_elections: dict = self.command.commander_elections if self.command is not None else {}
+        self._commander_gap_start: dict = {}
+
         for d in drones:
             self.mesh.update_known_position(d.id, d.x, d.y, d.alive)
 
@@ -162,6 +207,14 @@ class Swarm:
             _, outgoing = election.step(self.time_s, drone_id, drone.priority, inbox)
             all_outgoing.append(outgoing)
 
+        if self.command is not None:
+            # Same inboxes as above -- commander-layer messages arrive
+            # over the exact same mesh, just filtered by layer inside
+            # NexusElection.step() itself. Must run before the broadcast
+            # loop below so commander-layer outgoing messages go out the
+            # same tick they're produced, same as every other layer.
+            self.command.reconcile_and_step_commander_layer(self, inboxes, all_outgoing)
+
         for outgoing in all_outgoing:
             for message in outgoing:
                 self.mesh.broadcast(message, self.time_s)
@@ -185,14 +238,24 @@ class Swarm:
             # currently nexus, and the relay/leaf distinction it weighs
             # reassignment decisions by.
             new_assignments = self.mission.tick(self)
-            for drone_id, zone_id in new_assignments:
-                self.event_log.append({
-                    "tick": self.tick_count,
-                    "type": "mission_assigned",
-                    "detail": f"{drone_id} assigned to zone {zone_id}",
-                    "drone": drone_id,
-                    "zone": zone_id,
-                })
+            for result in new_assignments:
+                drone_id, zone_id = result["drone_id"], result["zone_id"]
+                if result["kind"] == "substitution":
+                    self.event_log.append({
+                        "tick": self.tick_count,
+                        "type": "battery_substitution",
+                        "detail": f"{drone_id} dispatched to relieve a draining occupant in zone {zone_id}",
+                        "drone": drone_id,
+                        "zone": zone_id,
+                    })
+                else:
+                    self.event_log.append({
+                        "tick": self.tick_count,
+                        "type": "mission_assigned",
+                        "detail": f"{drone_id} assigned to zone {zone_id}",
+                        "drone": drone_id,
+                        "zone": zone_id,
+                    })
 
         if len(self.event_log) > MAX_EVENT_LOG:
             self.event_log = self.event_log[-MAX_EVENT_LOG:]
@@ -201,8 +264,9 @@ class Swarm:
         if previous is None:
             return
         prev_role, _ = previous
+        kind = _transition_kind(prev_role, election.role)
 
-        if prev_role != ElectionRole.CANDIDATE and election.role == ElectionRole.CANDIDATE:
+        if kind == "started":
             self.metrics.elections_started += 1
             self.event_log.append({
                 "tick": self.tick_count,
@@ -210,7 +274,7 @@ class Swarm:
                 "detail": f"{drone_id} lost contact with its nexus and started a campaign (term {election.term})",
                 "drones": [drone_id],
             })
-        elif prev_role == ElectionRole.CANDIDATE and election.role == ElectionRole.NEXUS:
+        elif kind == "won":
             self.metrics.elections_won += 1
             self.event_log.append({
                 "tick": self.tick_count,
@@ -218,12 +282,46 @@ class Swarm:
                 "detail": f"{drone_id} elected nexus (term {election.term})",
                 "winner": drone_id,
             })
-        elif prev_role == ElectionRole.NEXUS and election.role == ElectionRole.FOLLOWER:
+        elif kind == "merged":
             self.metrics.merges += 1
             self.event_log.append({
                 "tick": self.tick_count,
                 "type": "swarms_merged",
                 "detail": f"{drone_id} yielded nexus to {election.known_nexus_id} (newer term {election.term})",
+                "drones": [drone_id],
+            })
+
+    def _log_commander_transition(self, drone_id: str, previous, election: NexusElection) -> None:
+        """Same classification as _log_transition, distinct event types
+        and counters -- see command.py for why this is a second,
+        independent election rather than the same one relabeled."""
+        if previous is None:
+            return
+        prev_role, _ = previous
+        kind = _transition_kind(prev_role, election.role)
+
+        if kind == "started":
+            self.metrics.commander_elections_started += 1
+            self.event_log.append({
+                "tick": self.tick_count,
+                "type": "commander_election_started",
+                "detail": f"{drone_id} (platoon nexus) lost contact with the commander and started a campaign (term {election.term})",
+                "drones": [drone_id],
+            })
+        elif kind == "won":
+            self.metrics.commander_elections_won += 1
+            self.event_log.append({
+                "tick": self.tick_count,
+                "type": "commander_elected",
+                "detail": f"{drone_id} elected commander (term {election.term})",
+                "winner": drone_id,
+            })
+        elif kind == "merged":
+            self.metrics.commander_merges += 1
+            self.event_log.append({
+                "tick": self.tick_count,
+                "type": "commander_merged",
+                "detail": f"{drone_id} yielded commander to {election.known_nexus_id} (newer term {election.term})",
                 "drones": [drone_id],
             })
 
@@ -240,6 +338,22 @@ class Swarm:
             start = self._nexus_gap_start.pop(drone_id, None)
             if start is not None:
                 self.metrics.record_recovery(self.time_s - start)
+
+    def _track_commander_recovery(self, drone_id: str, previous, election: NexusElection) -> None:
+        """Same shape as _track_recovery, a separate gap-start dict
+        (self._commander_gap_start) so a drone that's simultaneously
+        tracked at both tiers (it's a platoon nexus running a commander
+        campaign) never has one tier's bookkeeping clobber the other's."""
+        if previous is None:
+            return
+        _, prev_commander = previous
+        curr_commander = election.known_nexus_id
+        if prev_commander is not None and curr_commander is None:
+            self._commander_gap_start[drone_id] = self.time_s
+        elif prev_commander is None and curr_commander is not None:
+            start = self._commander_gap_start.pop(drone_id, None)
+            if start is not None:
+                self.metrics.record_commander_recovery(self.time_s - start)
 
     def _move(self) -> None:
         for drone in self.drones.values():
@@ -288,7 +402,10 @@ class Swarm:
                 drone.role = "relay" if degree >= 2 else "leaf"
 
     def metrics_snapshot(self) -> dict:
-        return self.metrics.snapshot(self.mesh, self.elections)
+        snapshot = self.metrics.snapshot(self.mesh, self.elections)
+        if self.command is not None:
+            snapshot["commander"] = self.metrics.commander_snapshot(self.commander_elections)
+        return snapshot
 
     def to_state_dict(self) -> dict:
         edges = sorted({tuple(sorted((a, b))) for a, neighbors in self._last_adjacency.items() for b in neighbors})
@@ -302,4 +419,6 @@ class Swarm:
         }
         if self.mission is not None:
             state["mission"] = self.mission.to_state_dict()
+        if self.command is not None:
+            state["command"] = self.command.to_state_dict(self)
         return state

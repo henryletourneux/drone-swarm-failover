@@ -32,6 +32,15 @@ import math
 from dataclasses import dataclass, field
 
 MIN_BATTERY_TO_ASSIGN = 20.0
+# Above MIN_BATTERY_TO_ASSIGN on purpose: this is an early-warning
+# threshold that dispatches a reserve replacement toward a zone before
+# the occupant actually becomes ineligible, so the zone is never left
+# uncovered waiting for a swap.
+LOW_BATTERY_WARNING = 35.0
+# A drone counts as "reserve" for substitution purposes only above this
+# fraction of full battery -- otherwise a substitution could pull in a
+# drone that's itself about to need relief.
+RESERVE_BATTERY_FRACTION = 0.5
 ROLE_REASSIGN_BONUS = {"leaf": 0.2, "relay": -0.3, "nexus": -1.0, "unassigned": 0.0}
 
 
@@ -51,6 +60,16 @@ class MissionConfig:
     base_drain_per_tick: float = 0.01
     move_drain_per_unit: float = 0.003
     contested_drain_per_tick: float = 0.2
+    # Default 0.0 -- holding a *secured* zone costs nothing extra beyond
+    # ordinary existence by default, same as always. This exists as a
+    # separate, targeted knob from base_drain_per_tick specifically so a
+    # live demo can make secured occupants drain faster (to make battery
+    # substitution observable in a reasonable time) WITHOUT speeding up
+    # the ambient drain every drone pays regardless of what it's doing --
+    # base_drain_per_tick has no recharge mechanic behind it, so bumping
+    # it broadly caps the whole swarm's real-world lifespan, which nearly
+    # broke the live demo entirely (see server.py's SCALE_MISSION).
+    secured_occupancy_drain_per_tick: float = 0.0
     reallocation_interval_ticks: int = 10
 
 
@@ -92,8 +111,11 @@ class HeuristicAllocator:
     def allocate(self, drones: dict, zone_statuses: list, arena_diagonal: float) -> dict:
         """Returns {drone_id: zone_id} for every NEW assignment decided
         this call -- drones already adequately covering a secured zone
-        aren't reassigned, and only eligible (alive, charged) drones not
-        already committed elsewhere are considered."""
+        aren't reassigned, and only eligible (alive, charged, not already
+        committed or mid-flight to another zone) drones are considered.
+        The `mission_zone_id is None` check matters once substitutions
+        exist: without it, this periodic pass could steal a drone that's
+        already inbound to relieve a different zone before it arrives."""
         committed = {
             drone_id
             for status in zone_statuses
@@ -102,6 +124,7 @@ class HeuristicAllocator:
         eligible = [
             d for d in drones.values()
             if d.alive and d.battery > MIN_BATTERY_TO_ASSIGN and d.id not in committed
+            and d.mission_zone_id is None
         ]
 
         assignments: dict = {}
@@ -124,6 +147,54 @@ class HeuristicAllocator:
                 best = max(eligible, key=lambda d: self.score(d, status.zone, arena_diagonal))
                 assignments[best.id] = status.zone.id
                 eligible.remove(best)
+        return assignments
+
+    def plan_substitutions(self, drones: dict, zone_statuses: list, arena_diagonal: float) -> dict:
+        """Battery-substitution / reserve pool: returns {drone_id: zone_id}
+        for reserve drones newly dispatched to relieve a draining occupant,
+        called every tick (unlike `allocate`, which only runs on the
+        coarser `reallocation_interval_ticks` cadence) so relief doesn't
+        wait on the slow strategic reallocation pass.
+
+        "Reserve pool" here means alive, uncommitted drones with healthy
+        battery -- this simulation has no battery-recharge mechanic, so
+        there's no literal charging station to draw from.
+
+        Prioritizes which zone gets the next available reserve drone first
+        (most-drained occupant battery ascending, then zone threat_level
+        descending as a tiebreaker) when multiple zones need relief at
+        once and reserve is scarce.
+        """
+        committed = {
+            drone_id
+            for status in zone_statuses
+            for drone_id in status.occupant_ids
+        }
+        reserve = [
+            d for d in drones.values()
+            if d.alive and d.id not in committed and d.mission_zone_id is None
+            and d.battery >= 100.0 * RESERVE_BATTERY_FRACTION
+        ]
+
+        def most_drained_battery(status: ZoneStatus) -> float:
+            return min(drones[drone_id].battery for drone_id in status.occupant_ids)
+
+        needing_relief = sorted(
+            (
+                status for status in zone_statuses
+                if status.secured
+                and any(drones[drone_id].battery < LOW_BATTERY_WARNING for drone_id in status.occupant_ids)
+            ),
+            key=lambda s: (most_drained_battery(s), -s.zone.threat_level),
+        )
+
+        assignments: dict = {}
+        for status in needing_relief:
+            if not reserve:
+                break
+            best = max(reserve, key=lambda d: self.score(d, status.zone, arena_diagonal))
+            assignments[best.id] = status.zone.id
+            reserve.remove(best)
         return assignments
 
 
@@ -162,39 +233,99 @@ class MissionState:
             drone.battery = max(0.0, drone.battery - self.config.base_drain_per_tick - moved * self.config.move_drain_per_unit)
 
         for status in self.zone_statuses.values():
-            if status.secured:
+            extra_drain = (
+                self.config.contested_drain_per_tick * status.zone.threat_level
+                if not status.secured
+                else self.config.secured_occupancy_drain_per_tick
+            )
+            if extra_drain <= 0.0:
                 continue
             for drone_id in status.occupant_ids:
                 drone = drones[drone_id]
-                drone.battery = max(0.0, drone.battery - self.config.contested_drain_per_tick * status.zone.threat_level)
+                drone.battery = max(0.0, drone.battery - extra_drain)
+
+    def _release_relieved_occupants(self, drones: dict) -> None:
+        """Once a reserve replacement has physically arrived at a zone
+        (occupant count exceeds requirement), hand off by releasing the
+        tired, lowest-battery excess occupant(s) -- not before, so the
+        zone is never under-secured mid-swap. A drone that's arrived and
+        still needed keeps holding no matter how low its battery gets;
+        this only fires once it's genuinely surplus."""
+        for status in self.zone_statuses.values():
+            surplus = len(status.occupant_ids) - status.zone.required_drones
+            if surplus <= 0:
+                continue
+            draining = sorted(
+                (drones[drone_id] for drone_id in status.occupant_ids if drones[drone_id].battery < LOW_BATTERY_WARNING),
+                key=lambda d: d.battery,
+            )
+            for drone in draining[:surplus]:
+                drone.mission_zone_id = None
+                status.occupant_ids.remove(drone.id)
+            status.secured = len(status.occupant_ids) >= status.zone.required_drones
 
     def tick(self, swarm) -> list:
-        """Advances battery/occupancy bookkeeping, and reallocates via the
-        current nexus every `reallocation_interval_ticks`. Returns a list
-        of (drone_id, zone_id) newly-made assignments this call, for the
-        caller to log/narrate -- empty most ticks."""
+        """Advances battery/occupancy bookkeeping, relieves draining
+        occupants once relief has arrived, dispatches urgent reserve
+        substitutions every tick (fast reactive layer), and reallocates
+        via the current nexus every `reallocation_interval_ticks` (slower
+        strategic layer). Returns a list of {"drone_id", "zone_id",
+        "kind"} for newly-made assignments this call ("substitution" or
+        "assignment"), for the caller to log/narrate -- empty most ticks.
+        """
         self._drain_batteries(swarm.drones)
         self._occupants_of(swarm.drones)
+        self._release_relieved_occupants(swarm.drones)
 
         for drone in swarm.drones.values():
             if drone.mission_zone_id is not None:
                 status = self.zone_statuses.get(drone.mission_zone_id)
                 if status is not None and drone.id in status.occupant_ids:
                     continue  # arrived, still holding its assignment
+                if status is not None and status.secured:
+                    # A zone can be secured without this drone's help in
+                    # two different ways, and only one of them means it's
+                    # not needed: (a) OTHER, physically-closer drones got
+                    # there first -- genuinely stale, release it, or this
+                    # drone would carry a dead assignment forever, starving
+                    # the substitution reserve pool of real spare capacity;
+                    # (b) it's a substitution dispatch en route to relieve
+                    # a still-draining occupant -- the zone reads as
+                    # "secured" the whole time (that's what makes it a
+                    # substitution and not a fresh assignment), so it must
+                    # NOT be released before it arrives, or every
+                    # substitution redispatches itself in an infinite loop.
+                    still_needs_relief = any(
+                        swarm.drones[occ_id].battery < LOW_BATTERY_WARNING
+                        for occ_id in status.occupant_ids
+                    )
+                    if not still_needs_relief:
+                        drone.mission_zone_id = None
+                        continue
             if drone.battery <= MIN_BATTERY_TO_ASSIGN or not drone.alive:
                 drone.mission_zone_id = None
 
-        self._ticks_since_reallocation += 1
         nexus_id = next((d.id for d in swarm.drones.values() if d.alive and d.role == "nexus"), None)
-        if nexus_id is None or self._ticks_since_reallocation < self.config.reallocation_interval_ticks:
+        self._ticks_since_reallocation += 1
+        if nexus_id is None:
             return []
-        self._ticks_since_reallocation = 0
 
         arena_diagonal = math.hypot(swarm.width, swarm.height)
-        new_assignments = self.allocator.allocate(swarm.drones, list(self.zone_statuses.values()), arena_diagonal)
-        for drone_id, zone_id in new_assignments.items():
+        results: list = []
+
+        substitutions = self.allocator.plan_substitutions(swarm.drones, list(self.zone_statuses.values()), arena_diagonal)
+        for drone_id, zone_id in substitutions.items():
             swarm.drones[drone_id].mission_zone_id = zone_id
-        return list(new_assignments.items())
+            results.append({"drone_id": drone_id, "zone_id": zone_id, "kind": "substitution"})
+
+        if self._ticks_since_reallocation >= self.config.reallocation_interval_ticks:
+            self._ticks_since_reallocation = 0
+            new_assignments = self.allocator.allocate(swarm.drones, list(self.zone_statuses.values()), arena_diagonal)
+            for drone_id, zone_id in new_assignments.items():
+                swarm.drones[drone_id].mission_zone_id = zone_id
+                results.append({"drone_id": drone_id, "zone_id": zone_id, "kind": "assignment"})
+
+        return results
 
     def all_secured(self) -> bool:
         return all(status.secured for status in self.zone_statuses.values())
