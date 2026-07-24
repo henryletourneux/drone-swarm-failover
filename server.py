@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from antagonist.attacks import Antagonist
 from drone_swarm.command import CommandConfig
 from drone_swarm.mission import MissionConfig, Zone
+from drone_swarm.patrol import PatrolConfig
 from drone_swarm.simulation import create_random_swarm
 from drone_swarm.swarm import SwarmConfig
 
@@ -51,6 +52,20 @@ SCALE_MISSION = MissionConfig(
     secured_occupancy_drain_per_tick=0.17,
 )
 
+# Scale mode's mission only ever commits 24 of 100 drones to zones (8+6+10),
+# so there's always a large, genuinely idle pool for patrol.py's dispatch to
+# draw from (see patrol.py's module docstring for why "idle pool" and not
+# "zone surplus" is the real dispatch source) -- not wired into Security
+# mode, which has no mission_config at all, so patrol would just spawn
+# disturbances nobody ever investigates.
+SCALE_PATROL = PatrolConfig(
+    spawn_interval_ticks=60,             # ~24 real seconds at TICK_SECONDS=0.4
+    max_active_disturbances=2,
+    investigation_range=35.0,
+    investigation_ticks_required=20,     # ~8 real seconds once a drone arrives
+    spawn_margin=60.0,
+)
+
 def _platoon_of(n: int, platoon_size: int) -> dict:
     """Static platoon assignment for hierarchical command (drone_swarm/
     command.py) -- drone ids from create_random_swarm are always D0..D(n-1)
@@ -78,7 +93,8 @@ def _platoon_of(n: int, platoon_size: int) -> dict:
 MODE_SPECS = {
     "scale": dict(n=100, width=1400, height=900, comm_range=180,
                   config=SwarmConfig(max_relay_hops=2, mission_config=SCALE_MISSION,
-                                      command_config=CommandConfig(platoon_of=_platoon_of(100, 10)))),
+                                      command_config=CommandConfig(platoon_of=_platoon_of(100, 10)),
+                                      patrol_config=SCALE_PATROL)),
     "security": dict(n=14, width=800, height=500, comm_range=180,
                       config=SwarmConfig(bft_mode=True, max_relay_hops=2,
                                           command_config=CommandConfig(platoon_of=_platoon_of(14, 4)))),

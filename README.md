@@ -78,6 +78,18 @@ Both tiers run over the exact same mesh — there's no separate long-range radio
 
 **Honest limitation, stated plainly**: if the current platoon-nexus subgraph isn't fully reachable within `max_relay_hops` — dispersed platoons, a small `comm_range`, or a real partition — no single commander converges; each mutually-reachable cluster elects its own, exactly mirroring the flat layer's own already-tested multi-nexus-under-partition behavior. That's why `commander_ids()` returns a list, not a single id.
 
+## Patrol and disturbance investigation (`SwarmConfig(patrol_config=...)`)
+
+`drone_swarm/patrol.py` spawns dynamic **disturbance** sites in the arena that the swarm's genuinely idle drones — alive, not currently holding a mission zone, not already investigating something else — break off to investigate: travel to the site, hold there accruing investigation time, and resolve it once enough time has passed. Built directly on top of `mission.py` rather than as a parallel system: dispatch reuses the exact same idle/reserve-pool notion `HeuristicAllocator.plan_substitutions()` already established for battery-substitution relief, and a resolved investigator is simply freed (`investigating_disturbance_id = None`) for `MissionState`'s own allocation/substitution machinery to pick back up — no bespoke "return to post" logic.
+
+**A real design bug found while building this, worth naming**: the first version dispatched from a zone's *surplus* occupants (beyond `required_drones`) rather than the idle pool. That's a different failure mode than a typical off-by-one — `HeuristicAllocator.allocate()` never assigns more than a zone's `required_drones` in the first place, so genuine surplus essentially never occurs under any realistic mission configuration, meaning disturbances would spawn and simply never get investigated. Caught by two end-to-end tests that failed against the surplus-based version and pass against the idle-pool version (`test_investigation_requires_arrival_before_accruing_progress`, `test_resolved_disturbance_frees_investigator_into_reserve_pool`), independently re-verified by reintroducing the surplus-based logic and confirming seven tests fail against it before restoring the fix.
+
+**A second, cross-module bug the first one exposed**: neither `HeuristicAllocator.allocate()` nor `LearnedAllocator.allocate()` checked `investigating_disturbance_id` before assigning a drone to a mission zone — so the periodic reallocation pass could hand a zone assignment to a drone that was still mid-investigation. Because movement priority favors an active investigation over a mission-zone assignment, the drone would never actually travel to the zone it was just assigned, silently orphaning both. `LearnedAllocator.allocate()` additionally turned out to have never checked `mission_zone_id` at all — a pre-existing gap independent of patrol.py, fixed alongside it for consistency between the two allocator implementations. Regression-tested by `test_allocator_does_not_steal_a_drone_mid_investigation`, likewise independently verified by reverting the fix and confirming the test fails.
+
+**Honest limitation, stated plainly**: dispatch is greedy and single-pass, not globally optimal — each unresolved disturbance (oldest first) claims the single nearest currently-idle drone, one at a time. Two disturbances spawning on opposite sides of the arena in the same tick can each grab a suboptimal drone if a truly optimal assignment would have crossed them — the same tradeoff `HeuristicAllocator` already makes for zone assignment (greedy and explainable over globally optimal). It's also a soft dependency on `mission_config`: without an active mission there's no notion of "committed," so disturbances spawn and age but are never dispatched — nothing breaks, they just never resolve.
+
+Live in Scale mode's demo: a pulsing `!` marker with a fill-up progress ring shows each active disturbance, with a dashed line out to whichever drone is currently investigating it; it turns into a `✓` briefly on resolution before disappearing.
+
 ## Project structure
 
 ```
@@ -92,6 +104,8 @@ drone_swarm/
   swarm.py            # Swarm: owns drones, the mesh, and every drone's election state
   metrics.py          # recovery time, election/message counters — see Metrics below
   mission.py          # zone-coverage resource allocation — see Resource allocation below
+  patrol.py            # disturbance investigation — see Patrol and disturbance investigation above
+  command.py          # hierarchical platoon/commander election — see Hierarchical command above
   policy.py            # learned allocation policy (PyTorch) — a drop-in for mission.py's allocator
   train.py              # REINFORCE training + evaluation pipeline for policy.py
   simulation.py      # random swarm generator
@@ -99,7 +113,7 @@ drone_swarm/
 antagonist/          # adversarial testing tool — see the BFT section below
 server.py            # FastAPI + WebSocket server for the live browser demo (Scale / Security modes)
 frontend/            # canvas visualization (vanilla HTML/CSS/JS, no build step)
-tests/                 # pytest suite covering topology, mesh, election, swarm, BFT, and metrics behavior
+tests/                 # pytest suite covering topology, mesh, election, swarm, BFT, metrics, mission, policy, command, and patrol behavior
 ```
 
 ## Running it

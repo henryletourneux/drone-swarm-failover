@@ -51,6 +51,14 @@ class Drone:
     platoon_id: str | None = None
     commander_id: str | None = None
 
+    # Patrol/disturbance-investigation field (drone_swarm/patrol.py) -- inert
+    # unless SwarmConfig.patrol_config is supplied, same additive-layer
+    # principle as mission_zone_id/platoon_id above. Set while this drone is
+    # travelling to or holding at a disturbance. Only ever dispatched from
+    # the idle pool (mission_zone_id already None), so a drone investigates
+    # OR holds a mission zone, never both at once.
+    investigating_disturbance_id: str | None = None
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -64,4 +72,5 @@ class Drone:
             "mission_zone_id": self.mission_zone_id,
             "platoon_id": self.platoon_id,
             "commander_id": self.commander_id,
+            "investigating_disturbance_id": self.investigating_disturbance_id,
         }

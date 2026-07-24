@@ -10,6 +10,7 @@ from .identity import DroneIdentity, IdentityRegistry, SwarmAuthority
 from .mesh_network import MeshNetwork
 from .metrics import SwarmMetrics
 from .mission import MissionState
+from .patrol import PatrolState
 from .topology import build_adjacency
 
 MAX_EVENT_LOG = 200
@@ -55,6 +56,12 @@ class SwarmConfig:
     overall commander — the same principle again, None (default) means
     every drone runs a single flat, swarm-wide election exactly as
     before, zero effect on the base tests without it.
+
+    `patrol_config` turns on disturbance investigation (see patrol.py):
+    dynamically-spawned disturbance sites that spare mission drones break
+    off to investigate — same additive principle, None (default) is
+    entirely inert. Has a soft dependency on `mission_config` also being
+    set (see patrol.py's module docstring for what happens without it).
     """
 
     max_relay_hops: int = 4
@@ -66,6 +73,7 @@ class SwarmConfig:
     bft_mode: bool = False
     mission_config: object = None
     command_config: object = None
+    patrol_config: object = None
 
 
 class Swarm:
@@ -170,6 +178,11 @@ class Swarm:
         self._last_adjacency: dict = build_adjacency(self.drones, self.comm_range)
 
         self.mission = MissionState(self.config.mission_config) if self.config.mission_config is not None else None
+        # Separate Random instance from the mesh's own (both seeded from
+        # the same `seed` param is fine -- they're independent objects
+        # drawing from unrelated call sequences, so this doesn't correlate
+        # disturbance placement with packet-loss rolls).
+        self.patrol = PatrolState(self.config.patrol_config, random.Random(seed)) if self.config.patrol_config is not None else None
 
     def kill(self, drone_id: str) -> bool:
         drone = self.drones.get(drone_id)
@@ -255,6 +268,35 @@ class Swarm:
                         "detail": f"{drone_id} assigned to zone {zone_id}",
                         "drone": drone_id,
                         "zone": zone_id,
+                    })
+
+        if self.patrol is not None:
+            # Runs after mission.tick(): dispatch reads this tick's fresh
+            # zone_statuses (occupancy/surplus) to decide who's spare.
+            for result in self.patrol.tick(self, self.tick_count):
+                kind, disturbance_id = result["kind"], result["disturbance_id"]
+                if kind == "spawned":
+                    self.event_log.append({
+                        "tick": self.tick_count,
+                        "type": "disturbance_spawned",
+                        "detail": f"disturbance {disturbance_id} detected",
+                        "disturbance": disturbance_id,
+                    })
+                elif kind == "dispatched":
+                    self.event_log.append({
+                        "tick": self.tick_count,
+                        "type": "disturbance_dispatched",
+                        "detail": f"{result['drone_id']} dispatched to investigate {disturbance_id}",
+                        "drone": result["drone_id"],
+                        "disturbance": disturbance_id,
+                    })
+                else:
+                    self.event_log.append({
+                        "tick": self.tick_count,
+                        "type": "disturbance_resolved",
+                        "detail": f"{result['drone_id']} resolved disturbance {disturbance_id}",
+                        "drone": result["drone_id"],
+                        "disturbance": disturbance_id,
                     })
 
         if len(self.event_log) > MAX_EVENT_LOG:
@@ -359,6 +401,9 @@ class Swarm:
         for drone in self.drones.values():
             if not drone.alive:
                 continue
+            if self.patrol is not None and drone.investigating_disturbance_id is not None:
+                self._move_toward_disturbance(drone)
+                continue
             if self.mission is not None and drone.mission_zone_id is not None:
                 self._move_toward_zone(drone)
                 continue
@@ -387,6 +432,24 @@ class Swarm:
         distance = math.hypot(dx, dy)
         speed = math.hypot(drone.vx, drone.vy) or 4.0
         if distance <= max(zone.radius * 0.6, speed):
+            return
+        drone.x += dx / distance * speed
+        drone.y += dy / distance * speed
+
+    def _move_toward_disturbance(self, drone) -> None:
+        """Same steer-and-hold shape as `_move_toward_zone`, targeting a
+        point rather than a zone -- holds once within the investigation
+        range instead of overshooting through it, since that's the range
+        `PatrolState._advance` itself checks to accrue investigation
+        progress."""
+        disturbance = self.patrol.disturbances.get(drone.investigating_disturbance_id)
+        if disturbance is None:
+            drone.investigating_disturbance_id = None
+            return
+        dx, dy = disturbance.x - drone.x, disturbance.y - drone.y
+        distance = math.hypot(dx, dy)
+        speed = math.hypot(drone.vx, drone.vy) or 4.0
+        if distance <= max(self.patrol.config.investigation_range * 0.6, speed):
             return
         drone.x += dx / distance * speed
         drone.y += dy / distance * speed
@@ -421,4 +484,6 @@ class Swarm:
             state["mission"] = self.mission.to_state_dict()
         if self.command is not None:
             state["command"] = self.command.to_state_dict(self)
+        if self.patrol is not None:
+            state["patrol"] = self.patrol.to_state_dict()
         return state

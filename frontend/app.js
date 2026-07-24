@@ -30,6 +30,7 @@ const hudCommand = document.getElementById("hud-command");
 const platoonCountEl = document.getElementById("platoon-count");
 const commanderValueEl = document.getElementById("commander-value");
 const legendCommand = document.getElementById("legend-command");
+const legendPatrol = document.getElementById("legend-patrol");
 
 const stat = {
   recoveryMean: document.getElementById("stat-recovery-mean"),
@@ -173,6 +174,58 @@ function drawZones(zones) {
   }
 }
 
+// Disturbance sites (drone_swarm/patrol.py): a pulsing marker with a
+// progress ring that fills as the dispatched investigator accrues
+// investigation time, plus a dashed line out to whichever drone is
+// currently on the case -- drawn every frame for as long as the
+// investigation is ongoing (unlike the one-shot relief beacon above,
+// since a disturbance investigation is a long-running state, not a
+// single dispatch event to flash and forget).
+function drawDisturbances(disturbances, byId) {
+  const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 260);
+  for (const dist of disturbances) {
+    const p = worldToScreen(dist.x, dist.y);
+    const color = dist.resolved ? "110, 231, 183" : "255, 159, 67"; // green once resolved, amber while active
+    const baseR = 9;
+
+    if (dist.investigator_id && !dist.resolved) {
+      const inv = byId[dist.investigator_id];
+      if (inv) {
+        const ip = worldToScreen(inv.x, inv.y);
+        ctx.save();
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = `rgba(${color}, 0.45)`;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(ip.x, ip.y);
+        ctx.lineTo(p.x, p.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, baseR + (dist.resolved ? 0 : pulse * 4), 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(${color}, ${dist.resolved ? 0.5 : 0.55 + pulse * 0.3})`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    if (dist.progress > 0 && !dist.resolved) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, baseR + 7, -Math.PI / 2, -Math.PI / 2 + dist.progress * Math.PI * 2);
+      ctx.strokeStyle = `rgba(${color}, 0.9)`;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+
+    ctx.font = "12px system-ui, -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = `rgba(${color}, 0.95)`;
+    ctx.fillText(dist.resolved ? "✓" : "!", p.x, p.y);
+  }
+}
+
 function draw() {
   const rect = canvas.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
@@ -203,6 +256,8 @@ function draw() {
   for (const d of drones) {
     drawDrone(d);
   }
+
+  if (state.patrol) drawDisturbances(state.patrol.disturbances, byId);
 
   // Antagonist attack: an incoming projectile (the forged packet arriving),
   // then a bigger impact + vignette pulse the instant it lands, so the
@@ -563,6 +618,7 @@ function renderModeUI() {
   modeSecurityBtn.classList.toggle("mode-btn--active", state.mode === "security");
   attackBtn.style.display = state.mode === "security" ? "" : "none";
   legendBattery.style.display = state.mission ? "" : "none";
+  legendPatrol.style.display = state.patrol ? "" : "none";
 }
 
 // Unlike renderModeUI, this runs every message (not gated on mode change):
@@ -591,6 +647,9 @@ const EV_LABEL = {
   commander_election_started: "CMD-ELECT",
   commander_elected: "COMMANDER",
   commander_merged: "CMD-MERGE",
+  disturbance_spawned: "DISTURB",
+  disturbance_dispatched: "INVESTIGATE",
+  disturbance_resolved: "RESOLVED",
 };
 
 const MAX_LOG_ROWS = 18;

@@ -105,10 +105,17 @@ class LearnedAllocator:
         self.episode_entropies = []
 
     def allocate(self, drones: dict, zone_statuses: list, arena_diagonal: float) -> dict:
+        # mission_zone_id/investigating_disturbance_id checks match
+        # HeuristicAllocator.allocate (drone_swarm/mission.py) -- without
+        # them this could steal a drone already inbound to relieve a
+        # different zone, or one currently off investigating a
+        # disturbance (drone_swarm/patrol.py), leaving it with a mission
+        # assignment it never actually travels to.
         committed = {d_id for s in zone_statuses for d_id in s.occupant_ids}
         eligible = [
             d for d in drones.values()
             if d.alive and d.battery > MIN_BATTERY_TO_ASSIGN and d.id not in committed
+            and d.mission_zone_id is None and d.investigating_disturbance_id is None
         ]
         needy = [s for s in zone_statuses if not s.secured]
         assignments: dict = {}
@@ -160,6 +167,7 @@ class LearnedAllocator:
         reserve = [
             d for d in drones.values()
             if d.alive and d.id not in committed and d.mission_zone_id is None
+            and d.investigating_disturbance_id is None
             and d.battery >= 100.0 * RESERVE_BATTERY_FRACTION
         ]
         needing_relief = sorted(

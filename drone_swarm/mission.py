@@ -115,7 +115,14 @@ class HeuristicAllocator:
         committed or mid-flight to another zone) drones are considered.
         The `mission_zone_id is None` check matters once substitutions
         exist: without it, this periodic pass could steal a drone that's
-        already inbound to relieve a different zone before it arrives."""
+        already inbound to relieve a different zone before it arrives.
+        The `investigating_disturbance_id is None` check is the same idea
+        for patrol.py's disturbance investigation (drone_swarm/patrol.py):
+        without it, this pass could steal a drone mid-investigation into a
+        zone assignment it then never travels to (movement priority favors
+        the investigation), silently orphaning both. Found as a real bug
+        via test_patrol.py's end-to-end tests, not just reasoned out --
+        see patrol.py's module docstring."""
         committed = {
             drone_id
             for status in zone_statuses
@@ -124,7 +131,7 @@ class HeuristicAllocator:
         eligible = [
             d for d in drones.values()
             if d.alive and d.battery > MIN_BATTERY_TO_ASSIGN and d.id not in committed
-            and d.mission_zone_id is None
+            and d.mission_zone_id is None and d.investigating_disturbance_id is None
         ]
 
         assignments: dict = {}
@@ -173,6 +180,7 @@ class HeuristicAllocator:
         reserve = [
             d for d in drones.values()
             if d.alive and d.id not in committed and d.mission_zone_id is None
+            and d.investigating_disturbance_id is None
             and d.battery >= 100.0 * RESERVE_BATTERY_FRACTION
         ]
 
