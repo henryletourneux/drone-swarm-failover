@@ -11,11 +11,22 @@ from .identity import DroneIdentity, IdentityRegistry, SwarmAuthority
 from .mesh_network import MeshNetwork
 from .metrics import SwarmMetrics
 from .mission import MissionState
+from .obstacles import obstacle_avoidance
 from .patrol import PatrolState
 from .spatial_grid import SpatialGrid
 from .topology import build_adjacency
 
 MAX_EVENT_LOG = 200
+
+# Obstacle-avoidance tuning (see Swarm._avoid_obstacles / obstacles.py).
+# Margin bigger than a typical drone's per-tick travel distance, so a
+# drone starts bending away before it's already grazing the surface, not
+# after. Weight high enough to reliably override a zone/disturbance/
+# flocking target's own pull at close range without needing per-mode
+# tuning -- obstacles are a hard physical constraint, everything else
+# here is a preference.
+OBSTACLE_AVOID_MARGIN = 35.0
+OBSTACLE_AVOID_WEIGHT = 1.8
 
 
 def _transition_kind(prev_role: ElectionRole, new_role: ElectionRole) -> str | None:
@@ -73,6 +84,14 @@ class SwarmConfig:
     drift-and-bounce, exactly as before this existed. Unlike every other
     `*_config` here, `FlockingConfig` isn't frozen — it's meant to be
     tuned live from the running demo, not fixed for the swarm's lifetime.
+
+    `obstacles` (see obstacles.py) is a plain tuple of static circular
+    barriers — empty by default, same additive principle as every config
+    above. Every movement mode (flocking, travelling to a mission zone,
+    travelling to a disturbance, and the plain drift-bounce fallback)
+    steers around them; a movement-only concept, not a radio one --
+    obstacles never affect mesh connectivity (see obstacles.py's module
+    docstring for why that's a deliberate scope line, not an oversight).
     """
 
     max_relay_hops: int = 4
@@ -86,6 +105,7 @@ class SwarmConfig:
     command_config: object = None
     patrol_config: object = None
     flocking_config: object = None
+    obstacles: tuple = ()
 
 
 class Swarm:
@@ -448,6 +468,7 @@ class Swarm:
                 continue
             if drone.vx == 0.0 and drone.vy == 0.0:
                 continue
+            drone.vx, drone.vy = self._avoid_obstacles(drone.x, drone.y, drone.vx, drone.vy, math.hypot(drone.vx, drone.vy))
             drone.x += drone.vx
             drone.y += drone.vy
             if drone.x < 0.0 or drone.x > self.width:
@@ -457,6 +478,26 @@ class Swarm:
                 drone.vy = -drone.vy
                 drone.y = max(0.0, min(self.height, drone.y))
 
+    def _avoid_obstacles(self, x: float, y: float, dx: float, dy: float, speed_cap: float) -> tuple:
+        """Blends `obstacles.py`'s repulsion into an already-decided
+        (dx, dy) step and re-clamps to `speed_cap`, so a drone bends
+        around an obstacle rather than slowing down or stopping at it --
+        used by every movement mode (see SwarmConfig.obstacles' docstring).
+        A no-op, returning (dx, dy) unchanged, when no obstacles are
+        configured (the common case) or none are close enough to matter."""
+        if not self.config.obstacles:
+            return dx, dy
+        avoid_x, avoid_y = obstacle_avoidance(x, y, self.config.obstacles, margin=OBSTACLE_AVOID_MARGIN, heading=(dx, dy))
+        if avoid_x == 0.0 and avoid_y == 0.0:
+            return dx, dy
+        combined_x = dx + avoid_x * OBSTACLE_AVOID_WEIGHT
+        combined_y = dy + avoid_y * OBSTACLE_AVOID_WEIGHT
+        combined_speed = math.hypot(combined_x, combined_y)
+        if combined_speed > speed_cap and combined_speed > 0:
+            combined_x = combined_x / combined_speed * speed_cap
+            combined_y = combined_y / combined_speed * speed_cap
+        return combined_x, combined_y
+
     def _move_flocking(self, drone, grid: SpatialGrid, flocking_config, target) -> None:
         """Boid-style coordinated movement for a drone with nothing else
         assigned (see flocking.py) -- steers together with nearby
@@ -464,7 +505,8 @@ class Swarm:
         instead of the old independent drift-and-bounce."""
         neighbor_ids = grid.neighbors_within(drone.id, flocking_config.neighbor_radius)
         neighbors = [self.drones[n_id] for n_id in neighbor_ids]
-        drone.vx, drone.vy = flock_velocity(drone, neighbors, flocking_config, target)
+        vx, vy = flock_velocity(drone, neighbors, flocking_config, target)
+        drone.vx, drone.vy = self._avoid_obstacles(drone.x, drone.y, vx, vy, flocking_config.max_speed)
         drone.x += drone.vx
         drone.y += drone.vy
         if drone.x < 0.0 or drone.x > self.width:
@@ -489,8 +531,9 @@ class Swarm:
         speed = math.hypot(drone.vx, drone.vy) or 4.0
         if distance <= max(zone.radius * 0.6, speed):
             return
-        drone.x += dx / distance * speed
-        drone.y += dy / distance * speed
+        step_x, step_y = self._avoid_obstacles(drone.x, drone.y, dx / distance * speed, dy / distance * speed, speed)
+        drone.x += step_x
+        drone.y += step_y
 
     def _move_toward_disturbance(self, drone) -> None:
         """Same steer-and-hold shape as `_move_toward_zone`, targeting a
@@ -507,8 +550,9 @@ class Swarm:
         speed = math.hypot(drone.vx, drone.vy) or 4.0
         if distance <= max(self.patrol.config.investigation_range * 0.6, speed):
             return
-        drone.x += dx / distance * speed
-        drone.y += dy / distance * speed
+        step_x, step_y = self._avoid_obstacles(drone.x, drone.y, dx / distance * speed, dy / distance * speed, speed)
+        drone.x += step_x
+        drone.y += step_y
 
     def _assign_roles(self, adjacency: dict) -> None:
         for drone in self.drones.values():
@@ -550,4 +594,6 @@ class Swarm:
                 "cohesion_weight": fc.cohesion_weight,
                 "max_speed": fc.max_speed,
             }
+        if self.config.obstacles:
+            state["obstacles"] = [{"id": o.id, "x": o.x, "y": o.y, "radius": o.radius} for o in self.config.obstacles]
         return state

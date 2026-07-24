@@ -22,6 +22,7 @@ from antagonist.attacks import Antagonist
 from drone_swarm.command import CommandConfig
 from drone_swarm.flocking import FlockingConfig
 from drone_swarm.mission import MissionConfig, Zone
+from drone_swarm.obstacles import Obstacle
 from drone_swarm.patrol import PatrolConfig
 from drone_swarm.simulation import create_random_swarm
 from drone_swarm.swarm import SwarmConfig
@@ -70,6 +71,19 @@ SCALE_PATROL = PatrolConfig(
     spawn_margin=60.0,
 )
 
+# Scattered clear of zone centers (SCALE_MISSION above) and each other, so
+# they read as real terrain to weave through rather than blocking any one
+# path outright -- patrol.py's own obstacle-awareness already keeps the
+# patrol route/disturbance spawns from landing inside one regardless.
+SCALE_OBSTACLES = (
+    Obstacle(id="OB1", x=700, y=300, radius=60),
+    Obstacle(id="OB2", x=1400, y=400, radius=70),
+    Obstacle(id="OB3", x=1000, y=900, radius=55),
+    Obstacle(id="OB4", x=500, y=950, radius=65),
+    Obstacle(id="OB5", x=1600, y=700, radius=50),
+)
+
+
 def _platoon_of(n: int, platoon_size: int) -> dict:
     """Static platoon assignment for hierarchical command (drone_swarm/
     command.py) -- drone ids from create_random_swarm are always D0..D(n-1)
@@ -105,7 +119,8 @@ MODE_SPECS = {
                   config=SwarmConfig(max_relay_hops=2, mission_config=SCALE_MISSION,
                                       command_config=CommandConfig(platoon_of=_platoon_of(100, 10)),
                                       patrol_config=SCALE_PATROL,
-                                      flocking_config=FlockingConfig())),
+                                      flocking_config=FlockingConfig(),
+                                      obstacles=SCALE_OBSTACLES)),
     "security": dict(n=14, width=800, height=500, comm_range=180,
                       config=SwarmConfig(bft_mode=True, max_relay_hops=2,
                                           command_config=CommandConfig(platoon_of=_platoon_of(14, 4)))),
@@ -238,7 +253,7 @@ def _add_user_disturbance(x, y) -> None:
         return
     clamped_x = max(0.0, min(swarm.width, float(x)))
     clamped_y = max(0.0, min(swarm.height, float(y)))
-    disturbance_id = swarm.patrol.add_disturbance(clamped_x, clamped_y, swarm.tick_count)
+    disturbance_id = swarm.patrol.add_disturbance(clamped_x, clamped_y, swarm.tick_count, obstacles=swarm.config.obstacles)
     swarm.event_log.append({
         "tick": swarm.tick_count,
         "type": "disturbance_spawned",

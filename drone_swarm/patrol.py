@@ -85,6 +85,7 @@ import math
 from dataclasses import dataclass, field
 
 from .mission import MIN_BATTERY_TO_ASSIGN
+from .obstacles import push_point_outside_all
 
 MIN_SEVERITY = 1
 MAX_SEVERITY = 3
@@ -160,9 +161,16 @@ class PatrolState:
     def _ensure_route(self, swarm) -> None:
         if self.route_waypoints:
             return
-        self.route_waypoints = _ring_waypoints(
+        waypoints = _ring_waypoints(
             swarm.width, swarm.height, self.config.route_waypoint_count, self.config.route_edge_margin,
         )
+        obstacles = swarm.config.obstacles
+        if obstacles:
+            # A waypoint landing inside an obstacle would mean the idle
+            # flock's own target is somewhere physically unreachable --
+            # nudge any such waypoint to the nearest clear point instead.
+            waypoints = [push_point_outside_all(x, y, obstacles) for x, y in waypoints]
+        self.route_waypoints = waypoints
 
     def patrol_target(self, swarm) -> tuple | None:
         """The single shared destination idle/flocking drones should
@@ -201,12 +209,14 @@ class PatrolState:
         m = self.config.spawn_margin
         x = self._rng.uniform(m, max(m, swarm.width - m))
         y = self._rng.uniform(m, max(m, swarm.height - m))
+        if swarm.config.obstacles:
+            x, y = push_point_outside_all(x, y, swarm.config.obstacles)
         disturbance_id = self._new_id()
         severity = self._rng.randint(MIN_SEVERITY, MAX_SEVERITY)
         self.disturbances[disturbance_id] = Disturbance(id=disturbance_id, x=x, y=y, spawned_tick=tick, severity=severity)
         return disturbance_id
 
-    def add_disturbance(self, x: float, y: float, tick: int) -> str:
+    def add_disturbance(self, x: float, y: float, tick: int, obstacles=()) -> str:
         """User-placed disturbance (e.g. a live-demo click), as opposed to
         the ambient auto-spawn above. Deliberately bypasses
         `max_active_disturbances` -- that cap exists to keep unattended,
@@ -215,7 +225,14 @@ class PatrolState:
         `_launch_random_attack` in server.py always fires regardless of
         ambient swarm state. Severity is still randomized rather than
         fixed, same as an auto-spawned one -- the operator is flagging
-        *where* to look, not diagnosing how serious it'll turn out to be."""
+        *where* to look, not diagnosing how serious it'll turn out to be.
+        `obstacles` defaults to empty rather than reading from a `swarm`
+        object (unlike _spawn) since the caller here is server.py's WS
+        handler, which already has the click coordinates in hand and
+        doesn't need this method to reach back into swarm state for
+        anything else."""
+        if obstacles:
+            x, y = push_point_outside_all(x, y, obstacles)
         disturbance_id = self._new_id()
         severity = self._rng.randint(MIN_SEVERITY, MAX_SEVERITY)
         self.disturbances[disturbance_id] = Disturbance(id=disturbance_id, x=x, y=y, spawned_tick=tick, severity=severity)

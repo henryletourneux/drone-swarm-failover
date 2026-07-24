@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from drone_swarm.mission import MissionConfig, MissionState, Zone
 from drone_swarm.model import Drone
+from drone_swarm.obstacles import Obstacle, point_inside_any
 from drone_swarm.patrol import Disturbance, PatrolConfig, PatrolState, _ring_waypoints
 from drone_swarm.swarm import Swarm, SwarmConfig
 
@@ -46,8 +47,9 @@ class _FixedRng:
         return b
 
 
-def _fake_swarm(drones: dict, mission: MissionState | None, width=300, height=300):
-    return SimpleNamespace(drones=drones, mission=mission, width=width, height=height)
+def _fake_swarm(drones: dict, mission: MissionState | None, width=300, height=300, obstacles=()):
+    config = SimpleNamespace(obstacles=obstacles)
+    return SimpleNamespace(drones=drones, mission=mission, width=width, height=height, config=config)
 
 
 # -- Spawn cadence / cap ------------------------------------------------------
@@ -453,6 +455,31 @@ def test_ring_waypoints_count_and_inset_from_edges():
     for x, y in points:
         assert 100 - 1e-6 <= x <= 900 + 1e-6
         assert 100 - 1e-6 <= y <= 500 + 1e-6
+
+
+def test_ensure_route_nudges_waypoints_out_of_obstacles():
+    # A huge obstacle covering most of a small square arena's ring --
+    # guarantees at least one auto-generated waypoint would otherwise
+    # land inside it.
+    obstacles = (Obstacle(id="O1", x=150, y=150, radius=90),)
+    patrol = PatrolState(PatrolConfig(route_waypoint_count=8, route_edge_margin=10), _FixedRng())
+    swarm = _fake_swarm({}, None, width=300, height=300, obstacles=obstacles)
+
+    patrol._ensure_route(swarm)
+
+    assert all(not point_inside_any(x, y, obstacles) for x, y in patrol.route_waypoints)
+
+
+def test_spawn_nudges_disturbance_out_of_obstacles():
+    obstacles = (Obstacle(id="O1", x=150, y=150, radius=140),)  # covers nearly the whole arena
+    patrol = PatrolState(PatrolConfig(spawn_margin=1), _FixedRng())  # _FixedRng.uniform -> arena midpoint (150, 150)
+    mission = MissionState(MissionConfig(zones=()))
+    swarm = _fake_swarm({}, mission, width=300, height=300, obstacles=obstacles)
+
+    disturbance_id = patrol._spawn(swarm, tick=1)
+
+    d = patrol.disturbances[disturbance_id]
+    assert not point_inside_any(d.x, d.y, obstacles)
 
 
 def test_patrol_target_none_when_route_disabled():

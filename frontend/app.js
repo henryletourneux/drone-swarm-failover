@@ -32,6 +32,7 @@ const commanderValueEl = document.getElementById("commander-value");
 const legendCommand = document.getElementById("legend-command");
 const legendPatrol = document.getElementById("legend-patrol");
 const legendRoute = document.getElementById("legend-route");
+const legendObstacles = document.getElementById("legend-obstacles");
 
 const flockPanel = document.getElementById("flock-panel");
 const flockSeparation = document.getElementById("flock-separation");
@@ -157,6 +158,42 @@ function platoonColor(platoonId) {
 }
 
 // --- Drawing ----------------------------------------------------------------
+
+// Static obstacles (drone_swarm/obstacles.py): solid, hazard-striped
+// circles -- deliberately the most "physically solid"-reading shape on
+// the canvas, to read as impassable at a glance rather than just another
+// colored ring like zones/disturbances. Drawn first, under everything.
+function drawObstacles(obstacles) {
+  for (const obstacle of obstacles) {
+    const p = worldToScreen(obstacle.x, obstacle.y);
+    const r = obstacle.radius * scale;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.clip();
+
+    ctx.fillStyle = "#1c2430";
+    ctx.fillRect(p.x - r, p.y - r, r * 2, r * 2);
+
+    ctx.strokeStyle = "rgba(255, 196, 0, 0.35)";
+    ctx.lineWidth = Math.max(4, r * 0.18);
+    const stripeGap = ctx.lineWidth * 1.6;
+    for (let offset = -r * 2; offset < r * 2; offset += stripeGap) {
+      ctx.beginPath();
+      ctx.moveTo(p.x - r + offset, p.y - r);
+      ctx.lineTo(p.x - r + offset + r * 2, p.y + r);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(255, 196, 0, 0.55)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
 
 // Threat-colored, dashed-until-secured mission zones (drone_swarm/mission.py),
 // drawn as the base layer so drones/edges render on top of them.
@@ -315,6 +352,7 @@ function draw() {
   const rect = canvas.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
 
+  if (state.obstacles) drawObstacles(state.obstacles);
   if (state.mission) drawZones(state.mission.zones);
   if (state.patrol) drawPatrolRoute(state.patrol);
 
@@ -721,6 +759,7 @@ function renderModeUI() {
   legendBattery.style.display = state.mission ? "" : "none";
   legendPatrol.style.display = state.patrol ? "" : "none";
   legendRoute.style.display = state.patrol ? "" : "none";
+  legendObstacles.style.display = state.obstacles ? "" : "none";
 }
 
 // --- Flocking controls -------------------------------------------------------

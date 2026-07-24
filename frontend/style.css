@@ -16,6 +16,7 @@
   --relief: #34d1c4;
   --commander: #c084fc;
   --patrol: #818cf8;
+  --obstacle: #ffc400;
   --mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", Consolas, "Liberation Mono", Menlo, monospace;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
@@ -229,6 +230,7 @@ canvas#swarm-canvas {
 .ring--relief { border-color: var(--relief); }
 .ring--commander { border-color: var(--commander); box-shadow: 0 0 6px var(--commander); }
 .dot--patrol { background: var(--patrol); }
+.dot--obstacle { background: #1c2430; border: 1.5px solid var(--obstacle); }
 
 .flock-panel {
   position: absolute;
