@@ -80,6 +80,8 @@ drone_swarm/
   swarm.py            # Swarm: owns drones, the mesh, and every drone's election state
   metrics.py          # recovery time, election/message counters — see Metrics below
   mission.py          # zone-coverage resource allocation — see Resource allocation below
+  policy.py            # learned allocation policy (PyTorch) — a drop-in for mission.py's allocator
+  train.py              # REINFORCE training + evaluation pipeline for policy.py
   simulation.py      # random swarm generator
   cli.py               # headless terminal demo, no server needed
 antagonist/          # adversarial testing tool — see the BFT section below
@@ -136,10 +138,34 @@ Allocation decisions are made by whichever drone is currently the elected nexus,
 
 It's live in Scale mode's demo (three zones of varying threat) — watch drones peel off, travel, and hold position as zones fill and lock in `secured`.
 
+### A learned allocation policy
+
+`drone_swarm/policy.py` and `drone_swarm/train.py` are a real, working reinforcement-learning pipeline (PyTorch, REINFORCE with an entropy bonus and a running-average baseline) trained against the mission environment above — not a heuristic dressed up, an actual small neural network (`AllocatorPolicy`) that scores each (drone, zone) pair and learns its own weights from simulated rollouts. `LearnedAllocator` implements the exact same `.allocate()` interface as `HeuristicAllocator`, so it's a genuine drop-in swap for `MissionState.allocator`, not a parallel system.
+
+**Design choice worth calling out**: the network's features are all *relative* (battery fraction, distance as a fraction of the arena diagonal, normalized threat/need, role, secured status) — never absolute drone count or swarm size. That makes the policy's input space agent-count-invariant: training on a small, fast-to-simulate swarm (8-14 drones, a couple of zones) is learning the same kind of decision a 100-drone deployment needs, not a smaller version of a different problem. `tests/test_policy.py` checks this explicitly, not just assumes it.
+
+**The honest result** (`python3 -m drone_swarm.train --evaluate-only`, 50 held-out episodes, not seen during training):
+
+| | zones secured | ticks to secure | fully-secured rate | avg battery left |
+|---|---|---|---|---|
+| Heuristic | 2.38 | 65.8 | 96% | 96.7 |
+| Learned | 2.40 | 81.3 | 98% | 95.1 |
+
+The learned policy is **not a clean win** — it matches the heuristic on outcome quality and is slightly more reliable (higher completion rate), but converges noticeably slower and leaves marginally less battery. That's reported as-is, not massaged, because a suspiciously perfect result would be a worse portfolio signal than an honest, comparable-tradeoffs one: it's evidence the evaluation is real, not tuned to make the model look good. A genuine improvement here would most likely need more training signal (actor-critic instead of vanilla REINFORCE, or reward shaping specifically tuned for speed) rather than just more episodes at the current setup — the training curve visibly plateaus well before 600 episodes.
+
+Two real bugs surfaced and fixed while building this, both worth naming because they're the kind of mistake specific to RL pipelines, not general software: (1) `LearnedAllocator` tracked its latest decisions as a "last call" snapshot rather than an explicit per-episode accumulate/reset lifecycle, which caused stale, already-backpropped tensors from a previous training episode to leak into the next one's loss computation, crashing on the second `.backward()` call with "trying to backward through the graph a second time"; (2) an early version of the "does training actually learn something" test reimplemented a simplified training loop that skipped the baseline subtraction the real `train()` uses, which is a well-known REINFORCE instability -- it wasn't testing the shipped pipeline, and the reimplemented version was genuinely unstable when I checked. Fixed by testing the real `train()` function directly, plus adding a surgical, isolated gradient-mechanic test (a simple two-zone "bandit" scenario checking REINFORCE actually shifts probability toward a clearly-better action) as the standard, environment-independent way to validate a policy-gradient implementation.
+
+```bash
+source .venv/bin/activate
+python3 -m drone_swarm.train                       # train from scratch + evaluate + save to models/allocator_policy.pt
+python3 -m drone_swarm.train --evaluate-only        # load the committed model and just run the comparison
+```
+
 ## Roadmap / possible extensions
 
 This project is deliberately scoped to a working, well-tested core first. Natural next steps if extended further:
-- **A learned allocation policy**: train a model (RL from simulated rollouts, or supervised imitation of/improvement on the heuristic) against the mission environment above, evaluated honestly against `HeuristicAllocator` — if it doesn't beat the baseline, that's a real finding to report, not something to bury.
+- **A better learned policy**: actor-critic instead of vanilla REINFORCE, to get past the plateau documented above.
+- **Live demo toggle**: swap `HeuristicAllocator` for the trained `LearnedAllocator` in Scale mode at runtime, so the comparison is visible, not just in an evaluation report.
 - **Obstacle course**: scripted "turret" hazards and barriers layered onto zone navigation, picking off whichever drone is currently nexus mid-mission.
 - **Route allocation through the real mesh**: replace the omniscient allocation call above with actual status-report messages, including the possibility of stale/missing data.
 - **`bft_mode` at real scale**: closing the gap documented above — likely needs batching/amortizing verification rather than one Ed25519 op per message, not just more connectivity tuning.
