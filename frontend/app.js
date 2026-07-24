@@ -122,6 +122,10 @@ function worldToScreen(x, y) {
   return { x: offsetX + x * scale, y: offsetY + y * scale };
 }
 
+function screenToWorld(x, y) {
+  return { x: (x - offsetX) / scale, y: (y - offsetY) / scale };
+}
+
 // --- Hierarchical command (drone_swarm/command.py) --------------------------
 //
 // Platoons are static, config-assigned groups (not derived from position),
@@ -582,9 +586,12 @@ canvas.addEventListener("mousemove", (e) => {
   const id = d ? d.id : null;
   if (id !== hoverId) {
     hoverId = id;
-    canvas.style.cursor = id ? "pointer" : "default";
     draw();
   }
+  // Crosshair over empty space signals "click to place a disturbance"
+  // when patrol is active in the current mode; plain pointer/default
+  // otherwise, same as before this feature existed.
+  canvas.style.cursor = id ? "pointer" : state.patrol ? "crosshair" : "default";
 });
 
 canvas.addEventListener("mouseleave", () => {
@@ -597,7 +604,19 @@ canvas.addEventListener("mouseleave", () => {
 
 canvas.addEventListener("click", (e) => {
   const d = droneAt(e.clientX, e.clientY);
-  if (d) send({ type: "kill", id: d.id });
+  if (d) {
+    send({ type: "kill", id: d.id });
+    return;
+  }
+  // Clicking empty arena space places a disturbance there, when patrol is
+  // active in the current mode (Security mode has no patrol_config -- see
+  // server.py's MODE_SPECS -- so state.patrol is absent and this is a
+  // no-op, matching the crosshair cursor only showing up in that case).
+  if (!state.patrol) return;
+  const rect = canvas.getBoundingClientRect();
+  const world = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+  if (world.x < 0 || world.x > WORLD_W || world.y < 0 || world.y > WORLD_H) return;
+  send({ type: "add_disturbance", x: world.x, y: world.y });
 });
 
 resetBtn.addEventListener("click", () => send({ type: "reset" }));

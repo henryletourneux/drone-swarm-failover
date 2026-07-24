@@ -97,6 +97,11 @@ class PatrolState:
         self._next_id = 0
         self.disturbances: dict[str, Disturbance] = {}
 
+    def _new_id(self) -> str:
+        disturbance_id = f"disturbance-{self._next_id}"
+        self._next_id += 1
+        return disturbance_id
+
     def _spawn(self, swarm, tick: int) -> str | None:
         active = sum(1 for d in self.disturbances.values() if not d.resolved)
         if active >= self.config.max_active_disturbances:
@@ -104,8 +109,19 @@ class PatrolState:
         m = self.config.spawn_margin
         x = self._rng.uniform(m, max(m, swarm.width - m))
         y = self._rng.uniform(m, max(m, swarm.height - m))
-        disturbance_id = f"disturbance-{self._next_id}"
-        self._next_id += 1
+        disturbance_id = self._new_id()
+        self.disturbances[disturbance_id] = Disturbance(id=disturbance_id, x=x, y=y, spawned_tick=tick)
+        return disturbance_id
+
+    def add_disturbance(self, x: float, y: float, tick: int) -> str:
+        """User-placed disturbance (e.g. a live-demo click), as opposed to
+        the ambient auto-spawn above. Deliberately bypasses
+        `max_active_disturbances` -- that cap exists to keep unattended,
+        randomly-timed spawns from cluttering the arena over time, not to
+        limit an explicit, one-at-a-time user action, the same way
+        `_launch_random_attack` in server.py always fires regardless of
+        ambient swarm state."""
+        disturbance_id = self._new_id()
         self.disturbances[disturbance_id] = Disturbance(id=disturbance_id, x=x, y=y, spawned_tick=tick)
         return disturbance_id
 

@@ -206,6 +206,30 @@ def _handle_control_message(message: dict) -> None:
         adversary = Antagonist(swarm)
     elif msg_type == "attack":
         _launch_random_attack()
+    elif msg_type == "add_disturbance":
+        _add_user_disturbance(message.get("x"), message.get("y"))
+
+
+def _add_user_disturbance(x, y) -> None:
+    """User-placed disturbance (clicking empty arena space in the
+    frontend, see app.js). A no-op if patrol isn't active in the current
+    mode (Security has no patrol_config -- see server.py's MODE_SPECS) or
+    the click payload is malformed; the frontend already gates the click
+    handler on `state.patrol` being present, this is defense-in-depth,
+    same principle as _launch_random_attack's bft_mode check above."""
+    if swarm.patrol is None:
+        return
+    if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        return
+    clamped_x = max(0.0, min(swarm.width, float(x)))
+    clamped_y = max(0.0, min(swarm.height, float(y)))
+    disturbance_id = swarm.patrol.add_disturbance(clamped_x, clamped_y, swarm.tick_count)
+    swarm.event_log.append({
+        "tick": swarm.tick_count,
+        "type": "disturbance_spawned",
+        "detail": f"disturbance {disturbance_id} placed by operator",
+        "disturbance": disturbance_id,
+    })
 
 
 def _current_nexus_id() -> str | None:

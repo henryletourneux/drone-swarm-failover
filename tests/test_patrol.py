@@ -306,6 +306,43 @@ def test_patrol_inert_without_mission_config():
     assert all(d.investigating_disturbance_id is None for d in swarm.drones.values())
 
 
+# -- User-placed disturbances (add_disturbance) -------------------------------
+
+def test_add_disturbance_bypasses_the_max_active_cap():
+    patrol = PatrolState(PatrolConfig(spawn_interval_ticks=1, max_active_disturbances=1), _FixedRng())
+    swarm = _fake_swarm({}, None)
+    patrol.tick(swarm, 1)
+    assert len(patrol.disturbances) == 1  # cap reached via ordinary auto-spawn
+
+    # A user-placed disturbance still goes through even though the cap is
+    # already full -- it's a deliberate one-off action, not ambient spawn
+    # traffic the cap is meant to throttle (see add_disturbance's
+    # docstring).
+    new_id = patrol.add_disturbance(12.0, 34.0, tick=2)
+    assert len(patrol.disturbances) == 2
+    placed = patrol.disturbances[new_id]
+    assert (placed.x, placed.y) == (12.0, 34.0)
+    assert placed.investigator_id is None
+
+
+def test_add_disturbance_is_picked_up_by_the_next_dispatch():
+    zone = Zone(id="Z", x=0, y=0, radius=10, required_drones=1)
+    mission = MissionState(MissionConfig(zones=(zone,)))
+    drones = {
+        "anchor": Drone(id="anchor", x=0, y=0, priority=1),
+        "idle": Drone(id="idle", x=100, y=100, priority=1),
+    }
+    mission._occupants_of(drones)
+
+    patrol = PatrolState(PatrolConfig(spawn_interval_ticks=100), _FixedRng())
+    swarm = _fake_swarm(drones, mission, width=200, height=200)
+    new_id = patrol.add_disturbance(95.0, 95.0, tick=0)
+
+    patrol._dispatch(swarm)
+
+    assert patrol.disturbances[new_id].investigator_id == "idle"
+
+
 def test_to_state_dict_includes_patrol_only_when_configured():
     plain = Swarm([Drone(id="A", x=0, y=0, priority=1)], comm_range=100, config=FAST, seed=1)
     assert "patrol" not in plain.to_state_dict()
