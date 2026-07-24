@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from antagonist.attacks import Antagonist
+from drone_swarm.command import CommandConfig
 from drone_swarm.mission import MissionConfig, Zone
 from drone_swarm.simulation import create_random_swarm
 from drone_swarm.swarm import SwarmConfig
@@ -50,6 +51,16 @@ SCALE_MISSION = MissionConfig(
     secured_occupancy_drain_per_tick=0.17,
 )
 
+def _platoon_of(n: int, platoon_size: int) -> dict:
+    """Static platoon assignment for hierarchical command (drone_swarm/
+    command.py) -- drone ids from create_random_swarm are always D0..D(n-1)
+    in order, so this can be computed from n alone before any Drone object
+    exists, same as the mode's other config. Simple contiguous chunking,
+    not derived from position (command.py's CommandConfig docstring notes
+    that's a deliberately separate, bigger feature)."""
+    return {f"D{i}": f"P{i // platoon_size}" for i in range(n)}
+
+
 # Two distinct live-demo modes, not one compromise config. Profiling found a
 # real tension: Ed25519 verification cost scales with message *volume*
 # (roughly messages_delivered), which scales combinatorially with
@@ -66,9 +77,11 @@ SCALE_MISSION = MissionConfig(
 #               demonstrate, already tuned to run comfortably.
 MODE_SPECS = {
     "scale": dict(n=100, width=1400, height=900, comm_range=180,
-                  config=SwarmConfig(max_relay_hops=2, mission_config=SCALE_MISSION)),
+                  config=SwarmConfig(max_relay_hops=2, mission_config=SCALE_MISSION,
+                                      command_config=CommandConfig(platoon_of=_platoon_of(100, 10)))),
     "security": dict(n=14, width=800, height=500, comm_range=180,
-                      config=SwarmConfig(bft_mode=True, max_relay_hops=2)),
+                      config=SwarmConfig(bft_mode=True, max_relay_hops=2,
+                                          command_config=CommandConfig(platoon_of=_platoon_of(14, 4)))),
 }
 DEFAULT_MODE = "scale"
 

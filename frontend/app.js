@@ -26,6 +26,10 @@ const modeSecurityBtn = document.getElementById("mode-security-btn");
 const connEl = document.getElementById("conn-indicator");
 const connLabel = document.getElementById("conn-label");
 const legendBattery = document.getElementById("legend-battery");
+const hudCommand = document.getElementById("hud-command");
+const platoonCountEl = document.getElementById("platoon-count");
+const commanderValueEl = document.getElementById("commander-value");
+const legendCommand = document.getElementById("legend-command");
 
 const stat = {
   recoveryMean: document.getElementById("stat-recovery-mean"),
@@ -115,6 +119,22 @@ function resizeCanvas() {
 
 function worldToScreen(x, y) {
   return { x: offsetX + x * scale, y: offsetY + y * scale };
+}
+
+// --- Hierarchical command (drone_swarm/command.py) --------------------------
+//
+// Platoons are static, config-assigned groups (not derived from position),
+// so color is the only honest way to show membership visually -- evenly
+// spaced hues across however many platoons the current mode has, looked up
+// by each platoon's sorted rank rather than hashed, so adjacent platoon ids
+// never land on visually-similar colors by coincidence.
+function platoonColor(platoonId) {
+  if (!state.command || !platoonId) return null;
+  const ids = Object.keys(state.command.platoons).sort();
+  const idx = ids.indexOf(platoonId);
+  if (idx === -1) return null;
+  const hue = Math.round((idx / ids.length) * 360);
+  return `hsl(${hue}, 70%, 60%)`;
 }
 
 // --- Drawing ----------------------------------------------------------------
@@ -369,6 +389,41 @@ function drawDrone(d) {
     ctx.stroke();
   }
 
+  // Platoon membership ring (drone_swarm/command.py): color is the only
+  // honest signal for a static, config-assigned grouping, since platoons
+  // aren't derived from position. Drawn tight around the role circle so it
+  // reads as "this drone's group" without competing with the nexus ring.
+  const pColor = state.command ? platoonColor(d.platoon_id) : null;
+  if (pColor) {
+    ctx.strokeStyle = pColor;
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.75;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r + 3, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // Commander badge: a platoon nexus already gets the gold "nexus" ring
+  // above, so the single (or, honestly, occasionally several -- see
+  // command.py's partition-tolerance note) overall commander needs a
+  // visibly bigger, differently-colored marker to stand out among several
+  // simultaneous platoon nexuses, not just another gold ring.
+  if (state.command && state.command.commander_ids.includes(d.id)) {
+    ctx.strokeStyle = "rgba(192, 132, 252, 0.85)";
+    ctx.lineWidth = 2.5;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r + 13, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.font = "13px system-ui, -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    ctx.fillStyle = "#c084fc";
+    ctx.fillText("♛", p.x, p.y - r - 16);
+  }
+
   // shadowBlur is expensive to run every frame for every drone, so only
   // the nexus (the one node worth calling out) gets it — everyone else
   // is already visually distinct by size/color alone.
@@ -510,6 +565,19 @@ function renderModeUI() {
   legendBattery.style.display = state.mission ? "" : "none";
 }
 
+// Unlike renderModeUI, this runs every message (not gated on mode change):
+// platoon nexus seats and commander_ids can change every tick as elections
+// resolve, independent of which demo mode is active.
+function renderCommandUI() {
+  const present = !!state.command;
+  hudCommand.style.display = present ? "" : "none";
+  legendCommand.style.display = present ? "" : "none";
+  if (!present) return;
+  platoonCountEl.textContent = Object.keys(state.command.platoons).length;
+  const commanders = state.command.commander_ids;
+  commanderValueEl.textContent = commanders.length ? commanders.join(", ") : DASH;
+}
+
 // --- Event log --------------------------------------------------------------
 
 const EV_LABEL = {
@@ -520,6 +588,9 @@ const EV_LABEL = {
   attack: "ATTACK",
   mission_assigned: "MISSION",
   battery_substitution: "RELIEF",
+  commander_election_started: "CMD-ELECT",
+  commander_elected: "COMMANDER",
+  commander_merged: "CMD-MERGE",
 };
 
 const MAX_LOG_ROWS = 18;
@@ -655,6 +726,7 @@ function connect() {
     }
 
     renderModeUI();
+    renderCommandUI();
 
     // Wherever the interpolation currently is (not necessarily fully
     // caught up yet) becomes the new starting point, so a message that
